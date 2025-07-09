@@ -6,24 +6,36 @@
 
 // Each block will compute the sum (reduce) of its section of the input array.
 // The result from each block is written to the output array.
-__global__ void reduce(float *d_input, float *d_output)
+__global__ void reduce_v2(float *d_input, float *d_output)
 {
     // Find the start of this block's data in the global array
     float *input_begin = d_input + blockDim.x * blockIdx.x;
+    // Initialize shared memory for this block
+    __shared__ float input_shared[THREAD_PER_BLOCK];
+    input_shared[threadIdx.x] = input_begin[threadIdx.x];
+    __syncthreads(); // Ensure all threads have written their data to shared memory
 
+    // if (threadIdx.x == 0, 1, 2, 3)
+    //    input_shared[threadIdx.x * 2] += input_shared[threadIdx.x * 2 + 1];
+    // if (threadIdx.x == 0, 4)
+    //     input_shared[threadIdx.x * 4] += input_shared[threadIdx.x * 4 + 2];
+    // if (threadIdx.x == 0)
+    //     input_shared[threadIdx.x * 8] += input_shared[threadIdx.x * 8 + 4];
     // Parallel reduction: repeatedly halve the number of participating threads
-    // On each step, only threads whose index is a multiple of 2*i add values
+    // On each step, threads with indices less than blockDim.x/(2*i) add the value 
+    // at index threadIdx.x*2*i to the value at threadIdx.x*2*i + i
     for (int i = 1; i < blockDim.x; i *= 2)
     {
-        if (threadIdx.x % (i * 2) == 0)
-        {
-            input_begin[threadIdx.x] += input_begin[threadIdx.x + i];
+        if (threadIdx.x <  blockDim.x / (i * 2))
+        {   
+            int index = threadIdx.x * 2 * i;
+            input_shared[index] += input_shared[index + i];
         }
         __syncthreads(); // Synchronize to make sure all threads are done before the next step
     }
     // Only the first thread in each block writes the final sum to the output array
     if (threadIdx.x == 0)
-        d_output[blockIdx.x] = input_begin[0];
+        d_output[blockIdx.x] = input_shared[0];
 }
 
 // Compare two arrays for near-equality; returns true if all elements are nearly the same
@@ -91,7 +103,7 @@ int main()
     dim3 Block(THREAD_PER_BLOCK, 1);
 
     // Launch reduction kernel
-    reduce<<<Grid, Block>>>(d_input, d_output);
+    reduce_v2<<<Grid, Block>>>(d_input, d_output);
 
     // Copy the per-block sums from GPU back to CPU
     cudaMemcpy(output, d_output, block_num * sizeof(float), cudaMemcpyDeviceToHost);
