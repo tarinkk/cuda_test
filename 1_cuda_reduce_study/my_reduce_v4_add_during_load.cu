@@ -2,21 +2,21 @@
 #include <cuda.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
-#define THREAD_PER_BLOCK 256
+#define THREAD_PER_BLOCK 128
 
 // Each block will compute the sum (reduce) of its section of the input array.
 // The result from each block is written to the output array.
-__global__ void reduce_v3(float *d_input, float *d_output)
+__global__ void reduce_v4(float *d_input, float *d_output)
 {
     // Find the start of this block's data in the global array
-    float *input_begin = d_input + blockDim.x * blockIdx.x;
+    // subarray_size = 2 * blockDim.x
+    float *input_begin = d_input + blockDim.x * blockIdx.x * 2;
     // Initialize shared memory for this block
     __shared__ float input_shared[THREAD_PER_BLOCK];
-    input_shared[threadIdx.x] = input_begin[threadIdx.x];
+    // Each thread sum two elements from global memory into shared memory
+    input_shared[threadIdx.x] = input_begin[threadIdx.x] + input_begin[threadIdx.x + blockDim.x];
     __syncthreads(); // Ensure all threads have written their data to shared memory
 
-    // if (threadIdx.x == 0, 1, 2, 3)
-    //    input_shared[threadIdx.x] += input_shared[threadIdx.x + 4];
     // if (threadIdx.x == 0, 1)
     //     input_shared[threadIdx.x] += input_shared[threadIdx.x + 2];
     // if (threadIdx.x == 0)
@@ -61,7 +61,10 @@ int main()
     cudaMalloc((void **)&d_input, N * sizeof(float));
 
     // Number of blocks: each block reduces THREAD_PER_BLOCK elements
-    int block_num = N / THREAD_PER_BLOCK;
+    int block_num = N / (2 * THREAD_PER_BLOCK);
+
+    // Size of each subarray that each block will process
+    int subarray_size = N / block_num;
 
     // Allocate memory for block-wise reduction results on CPU
     float *output = (float *)malloc(block_num * sizeof(float));
@@ -83,9 +86,9 @@ int main()
     for (int i = 0; i < block_num; i++)
     {
         float cur = 0;
-        for (int j = 0; j < THREAD_PER_BLOCK; j++)
+        for (int j = 0; j < subarray_size; j++)
         {
-            cur += input[i * THREAD_PER_BLOCK + j];
+            cur += input[i * subarray_size + j];
         }
         result[i] = cur;
     }
@@ -94,11 +97,11 @@ int main()
     cudaMemcpy(d_input, input, N * sizeof(float), cudaMemcpyHostToDevice);
 
     // Configure CUDA kernel launch: one block per chunk, THREAD_PER_BLOCK threads per block
-    dim3 Grid(N / THREAD_PER_BLOCK, 1);
+    dim3 Grid(block_num, 1);
     dim3 Block(THREAD_PER_BLOCK, 1);
 
     // Launch reduction kernel
-    reduce_v3<<<Grid, Block>>>(d_input, d_output);
+    reduce_v4<<<Grid, Block>>>(d_input, d_output);
 
     // Copy the per-block sums from GPU back to CPU
     cudaMemcpy(output, d_output, block_num * sizeof(float), cudaMemcpyDeviceToHost);

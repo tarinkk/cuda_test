@@ -5,6 +5,7 @@
     1. [Baseline](#baseline)
     2. [No Divergence Branch](#no-divergence-branch)
     3. [No Bank Conflict](#no-bank-conflict)
+    4. [Add During Load](#add-during-load)
 
 ## CUDA Reduction Kernel:
 
@@ -12,7 +13,8 @@ The CUDA kernel performs a parallel reduction operation to compute the sum of el
 
 **Input**: an array of length N.
 
-**Config**: M: split the array into M portions. (N is divisible by M.)
+**Config**: M: split the array into M portions, or the number of blocks. (N is divisible by M.)
+
 
 **Output**: an array of length M.
 
@@ -23,17 +25,19 @@ The CUDA kernel performs a parallel reduction operation to compute the sum of el
     float *input_begin = d_input + blockDim.x * blockIdx.x;
     // Initialize shared memory for this block
     __shared__ float input_shared[THREAD_PER_BLOCK];
+    // Threadwisely load data from global memory to shared memory
     input_shared[threadIdx.x] = input_begin[threadIdx.x];
     __syncthreads(); // Ensure all threads have written their data to shared memory
     ```
 
 2. **Parallel Reduction:**
 
-    we will compare several reduction strategies below.
+    we will compare several optimization strategies below.
 
     - Baseline (Binary-tree type)
     - No divergence branch
     - No bank conflict
+    - Add during Load
 
 3. **Output**:
 
@@ -159,7 +163,7 @@ To avoid bank conflict, it's better to ensure threads in a warp access consecuti
         input_shared: [a0, a1, a2, a3, a4, a5, a6, a7]
         ```
 
-    - **Step size 4**: Threads 0, 1, 2, 3 add elements at indices `threadIdx.x and threadIdx.x * 4` (e.g., thread 0 adds a4 to a0, thread 1 adds a5 to a1).
+    - **Step size 4**: Threads 0, 1, 2, 3 add elements at indices `threadIdx.x and threadIdx.x + 4` (e.g., thread 0 adds a4 to a0, thread 1 adds a5 to a1).
         ```
         input_shared: [a0+a4, a1+a5, a2+a6, a3+a7, a4, a5, a6, a7]
         ```
@@ -189,7 +193,51 @@ To avoid bank conflict, it's better to ensure threads in a warp access consecuti
     ```
 3. **Discussion**:
     - When step size i >= 32, thread `threadIdx.x` access bank `threadIdx.x % 32`, ensuring threads within the same warp access distinct banks.
-    - When step size i < 32, useful data is stored in addresses mapped to different banks, preventing bank conflicts.
+    - When step size i < 32, data is stored in addresses mapped to different banks, preventing bank conflicts.
+
+### Add During Load
+Each thread sums two elements from global memory before storing the result in shared memory
+
+1. **A block with 8 threads (Visualization)**:
+
+    `THREAD_PER_BlOCK` is halved. 
+
+    - **Initial state**: Starting from an array in global memory:
+        ```
+        input_begin: [a0, a1, a2, a3, a4, a5, a6, a7]
+        ```
+    
+    - **Add during load**: Threads 0, 1, 2, 3 sum elements at indices `threadIdx.x and threadIdx.x + 4` in global memory and then store the result at index `threadIdx.x in the shared memory.
+        ```
+        input_shared: [a0+a4, a1+a5, a2+a6, a3+a7]
+        ```
+
+    - **Step size 2**: Threads 0, 1 add elements at indices `threadIdx.x` and `threadIdx.x + 2` (e.g., thread 0 adds a0+a4 to a2+a6).
+        ```
+        input_shared: [a0+a4+a2+a6, a1+a5+a3+a7, a2+a6, a3+a7]
+        ```
+
+    - **Step size 1**: Thread 0 adds elements at indices `threadIdx.x ` and `threadIdx.x + 1` (i.e., a0+a4+a2+a6 to a1+a5+a3+a7).
+        ```
+        input_shared: [a0+a4+a2+a6+a1+a5+a3+a7, a1+a5+a3+a7, a2+a6, a3+a7]
+        ```
+
+2. **Key code**
+    ```cuda
+    // Find the start of this block's data in the global array
+    // subarray_size = 2 * blockDim.x
+    float *input_begin = d_input + blockDim.x * blockIdx.x * 2;
+    // Initialize shared memory for this block
+    __shared__ float input_shared[THREAD_PER_BLOCK];
+    // Each thread sum two elements from global memory into shared memory
+    input_shared[threadIdx.x] = input_begin[threadIdx.x] + input_begin[threadIdx.x + blockDim.x];
+    __syncthreads(); // Ensure all threads have written their data to shared memory
+    ```
+
+3. **Discussion**
+    - This strategy reduces shared memory accesses and synchronization, while leaves global memory access unchanged, decreasing the total computation time.
+    - It reduce shared memory usage as well as threads per blocks, potentially allowing more blocks to run concurrently on a streaming multiprocessor.
+
 ## Reference:
 1. [[CUDA]Reduce规约求和（已完结~）](https://www.bilibili.com/video/BV1HvBSY2EJW?spm_id_from=333.788.videopod.episodes&vd_source=aa41d00aebd84e6f99f529df7f83258a)
 2. [深入浅出GPU优化系列：reduce优化](https://zhuanlan.zhihu.com/p/426978026)
