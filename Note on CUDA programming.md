@@ -4,10 +4,17 @@
 1. [CUDA Reduction Kernel](#cuda-reduction-kernel)
     1. [Baseline](#baseline)
     2. [No Divergence Branch](#no-divergence-branch)
+    3. [No Bank Conflict](#no-bank-conflict)
 
 ## CUDA Reduction Kernel:
 
 The CUDA kernel performs a parallel reduction operation to compute the sum of elements in an input array. Each block processes a section of the input array, computes the sum of its elements, and writes the result to an output array.
+
+**Input**: an array of length N.
+
+**Config**: M: split the array into M portions. (N is divisible by M.)
+
+**Output**: an array of length M.
 
 1. **Data Loading**:
 
@@ -22,10 +29,11 @@ The CUDA kernel performs a parallel reduction operation to compute the sum of el
 
 2. **Parallel Reduction:**
 
-    we will compare several reduction algorithms below.
+    we will compare several reduction strategies below.
 
     - Baseline (Binary-tree type)
     - No divergence branch
+    - No bank conflict
 
 3. **Output**:
 
@@ -59,7 +67,7 @@ The CUDA kernel performs a parallel reduction operation to compute the sum of el
         input_shared: [a0+a1+a2+a3+a4+a5+a6+a7, a1, a2+a3, a3, a4+a5+a6+a7, a5, a6+a7, a7]
         ```
 
-2. **For a block with 2^N threads**:
+2. **Key Code**:
 
     ```cuda
     // double the step size i for each iteration
@@ -78,8 +86,10 @@ The CUDA kernel performs a parallel reduction operation to compute the sum of el
 
 
 ### No Divergence Branch
-
+Assign work to threads based on a stride that aligns with warp boundaries, ensuring all threads in a warp perform similar operations.
 1. **A block with 8 threads (Visualization)**:
+    
+    warp size is 2:
 
     - **Initial state**: Each thread loads one element into shared memory.
         ```
@@ -101,7 +111,7 @@ The CUDA kernel performs a parallel reduction operation to compute the sum of el
         input_shared: [a0+a1+a2+a3+a4+a5+a6+a7, a1, a2+a3, a3, a4+a5+a6+a7, a5, a6+a7, a7]
         ```
 
-2. **A block with 2^N threads**:
+2. **Key Code**:
 
     ```cuda
     // double the step size i for each iteration
@@ -121,16 +131,65 @@ The CUDA kernel performs a parallel reduction operation to compute the sum of el
     - **Thread Utilization**:
     Comparing to the baseline, for each iteration, only the first `blockDim.x/(2*i)` threads are active, utilizing a contiguous block of threads. This reduces thread divergence within warps, as active threads are grouped together, improving warp execution efficiency.
     - **Bank Conflicts**:
-    Consider `THREAD_PER_BLOCK = 64`, `i = 16`:
-        - **Active Threads**: `threadIdx.x < 64 / (2 * 16) = 64 / 32 = 2` (threads 0 to 1).
-        -  `index = threadIdx.x * 2 * 16 = 32 * threadIdx.x`
-        - Thread 0: Accesses `input_shared[0]` (bank 0) and `input_shared[16]` (bank 16).
-        - Thread 1: Accesses `input_shared[32]` (bank 0) and `input_shared[48]` (bank 16).
+    Let us assume `THREAD_PER_BLOCK` is large:
+        1. `i = 1`:
+            - **Active Threads**: `threadIdx.x < 64 / (2 * 1) = 32` (threads 0 to 31). 
+            -  `index = threadIdx.x * 2 * 1 = 2 * threadIdx.x`
+            - Thread 0: Accesses `input_shared[0]` (bank 0) and `input_shared[1]` (bank 1).
+            - Thread 16: Accesses `input_shared[32]` (bank 0) and `input_shared[33]` (bank 1).
+            - Thread N and Thread N+16 have conflict.
+        2. `i = 2`:
+            - **Active Threads**: `threadIdx.x < 64 / (2 * 2) = 16` (threads 0 to 31). 
+            -  `index = threadIdx.x * 2 * 2 = 4 * threadIdx.x`
+            - Threads N, N+8, N+16, N+32 have conflicts.
+        3. `i = 2^k`, `i <= 16`: 
+            - Threads `{N+ n (16/i) | n = 0,1, ...(2i-1)}`  have conflicts.
+        4.  `i>=16`:
+            - All threads have bank conflicts between each other. 
+
+### No Bank Conflict
+To avoid bank conflict, it's better to ensure threads in a warp access consecutive addresses that map to different banks.
+
+1. **A block with 8 threads (Visualization)**:
     
-    Both Thread 0 and 1 access bank 0, 16 (different addresses) where bank conflicts arise.
-    In general, when `THREAD_PER_BLOCK = 2^N` with `N>5`, step size i can reach `16`, where bank conflicts occur.  
+    With warp size 2, addresses 0, 2, 4, 6 are in bank 0, addresses 1,3,5,7 are in bank 1.
 
+    - **Initial state**: Each thread loads one element into shared memory.
+        ```
+        input_shared: [a0, a1, a2, a3, a4, a5, a6, a7]
+        ```
 
+    - **Step size 4**: Threads 0, 1, 2, 3 add elements at indices `threadIdx.x and threadIdx.x * 4` (e.g., thread 0 adds a4 to a0, thread 1 adds a5 to a1).
+        ```
+        input_shared: [a0+a4, a1+a5, a2+a6, a3+a7, a4, a5, a6, a7]
+        ```
+
+    - **Step size 2**: Threads 0, 1 add elements at indices `threadIdx.x` and `threadIdx.x + 2` (e.g., thread 0 adds a0+a4 to a2+a6).
+        ```
+        input_shared: [a0+a4+a2+a6, a1+a5+a3+a7, a2+a6, a3+a7, a4, a5, a6, a7]
+        ```
+
+    - **Step size 1**: Thread 0 adds elements at indices `threadIdx.x ` and `threadIdx.x + 1` (i.e., a0+a4+a2+a6 to a1+a5+a3+a7).
+        ```
+        input_shared: [a0+a4+a2+a6+a1+a5+a3+a7, a1+a5+a3+a7, a2+a6, a3+a7, a4, a5, a6, a7]
+        ```
+2. **Key Code**:
+    ```cuda
+    // half the step size for each iteration
+    // for each step size i, threads with indices less than i add the value 
+    // at index threadIdx.x to the value at threadIdx.x + i
+    for (int i = blockDim.x / 2; i > 0; i /= 2)
+    {
+        if (threadIdx.x < i)
+        {   
+            input_shared[threadIdx.x] += input_shared[threadIdx.x + i];
+        }
+        __syncthreads(); // Synchronize to make sure all threads are done before the next step
+    }
+    ```
+3. **Discussion**:
+    - When step size i >= 32, thread `threadIdx.x` access bank `threadIdx.x % 32`, ensuring threads within the same warp access distinct banks.
+    - When step size i < 32, useful data is stored in addresses mapped to different banks, preventing bank conflicts.
 ## Reference:
 1. [[CUDA]Reduce规约求和（已完结~）](https://www.bilibili.com/video/BV1HvBSY2EJW?spm_id_from=333.788.videopod.episodes&vd_source=aa41d00aebd84e6f99f529df7f83258a)
 2. [深入浅出GPU优化系列：reduce优化](https://zhuanlan.zhihu.com/p/426978026)

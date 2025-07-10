@@ -6,7 +6,7 @@
 
 // Each block will compute the sum (reduce) of its section of the input array.
 // The result from each block is written to the output array.
-__global__ void reduce_v1(float *d_input, float *d_output)
+__global__ void reduce_v3(float *d_input, float *d_output)
 {
     // Find the start of this block's data in the global array
     float *input_begin = d_input + blockDim.x * blockIdx.x;
@@ -15,18 +15,19 @@ __global__ void reduce_v1(float *d_input, float *d_output)
     input_shared[threadIdx.x] = input_begin[threadIdx.x];
     __syncthreads(); // Ensure all threads have written their data to shared memory
 
-    // if (threadIdx.x == 0, 2, 4, 6)
-    //    input_shared[threadIdx.x] += input_shared[threadIdx.x + 1];
-    // if (threadIdx.x == 0, 4)
+    // if (threadIdx.x == 0, 1, 2, 3)
+    //    input_shared[threadIdx.x] += input_shared[threadIdx.x + 4];
+    // if (threadIdx.x == 0, 1)
     //     input_shared[threadIdx.x] += input_shared[threadIdx.x + 2];
     // if (threadIdx.x == 0)
-    //     input_shared[threadIdx.x] += input_shared[threadIdx.x + 4];
-    // Parallel reduction: repeatedly halve the number of participating threads
-    // On each step, only threads whose index is a multiple of 2*i add values
-    for (int i = 1; i < blockDim.x; i *= 2)
+    //     input_shared[threadIdx.x] += input_shared[threadIdx.x * 8 + 1];
+    // half the step size for each iteration
+    // On each step i, threads with indices less than i add the value 
+    // at index threadIdx.x to the value at threadIdx.x + i
+    for (int i = blockDim.x / 2; i > 0; i /= 2)
     {
-        if (threadIdx.x % (i * 2) == 0)
-        {
+        if (threadIdx.x < i)
+        {   
             input_shared[threadIdx.x] += input_shared[threadIdx.x + i];
         }
         __syncthreads(); // Synchronize to make sure all threads are done before the next step
@@ -97,7 +98,7 @@ int main()
     dim3 Block(THREAD_PER_BLOCK, 1);
 
     // Launch reduction kernel
-    reduce_v1<<<Grid, Block>>>(d_input, d_output);
+    reduce_v3<<<Grid, Block>>>(d_input, d_output);
 
     // Copy the per-block sums from GPU back to CPU
     cudaMemcpy(output, d_output, block_num * sizeof(float), cudaMemcpyDeviceToHost);

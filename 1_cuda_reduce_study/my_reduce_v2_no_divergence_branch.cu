@@ -17,7 +17,7 @@ __global__ void reduce_v2(float *d_input, float *d_output)
 
     // if (threadIdx.x == 0, 1, 2, 3)
     //    input_shared[threadIdx.x * 2] += input_shared[threadIdx.x * 2 + 1];
-    // if (threadIdx.x == 0, 4)
+    // if (threadIdx.x == 0, 1)
     //     input_shared[threadIdx.x * 4] += input_shared[threadIdx.x * 4 + 2];
     // if (threadIdx.x == 0)
     //     input_shared[threadIdx.x * 8] += input_shared[threadIdx.x * 8 + 4];
@@ -56,9 +56,6 @@ int main()
 
     // --- Memory allocation on CPU ---
     // Q: Why do we use a pointer to allocate memory? Is input here a pointer?
-    // A: Yes, 'input' is a pointer. In C/C++, dynamic memory allocation for arrays 
-    //    (whose size is only known at runtime) is done using pointers and malloc. 
-    //    malloc returns a pointer to a block of memory large enough to hold N floats.
     float *input = (float *)malloc(N * sizeof(float));
 
     // --- Memory allocation on GPU ---
@@ -116,10 +113,6 @@ int main()
         printf("The answer is wrong\n");
         for (int i = 0; i < block_num; i++)
         {
-            // Q: What does %lf mean?
-            // A: %lf is a format specifier in printf for printing a double (long float).
-            //    Here, output[i] is float, but printf promotes it to double.
-            //    Using %f (for float or double) also works; in modern C, %f and %lf are equivalent for printf.
             printf("%lf ", output[i]);
         }
         printf("\n");
