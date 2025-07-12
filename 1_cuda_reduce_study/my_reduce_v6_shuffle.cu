@@ -6,31 +6,47 @@
 
 // Each block will compute the sum (reduce) of its section of the input array.
 // The result from each block is written to the output array.
-__global__ void reduce_v4(float *d_input, float *d_output)
+__global__ void reduce_v5(float *d_input, float *d_output)
 {
     // Find the start of this block's data in the global array
     // subarray_size = 2 * blockDim.x
     float *input_begin = d_input + blockDim.x * blockIdx.x * 2;
-    // Initialize shared memory for this block
-    __shared__ float input_shared[THREAD_PER_BLOCK];
-    // Each thread sum two elements from global memory into shared memory
-    input_shared[threadIdx.x] = input_begin[threadIdx.x] + input_begin[threadIdx.x + blockDim.x];
-    __syncthreads(); // Ensure all threads have written their data to shared memory
+    // Each thread sum two elements from global memory into a register 
+    float sum = input_begin[threadIdx.x] + input_begin[threadIdx.x + blockDim.x];
+    
+    // Shuffle within each warp to reduce the sum
+    sum += __shfl_down_sync(0xffffffff, sum, 16);
+    sum += __shfl_down_sync(0xffffffff, sum, 8);
+    sum += __shfl_down_sync(0xffffffff, sum, 4);
+    sum += __shfl_down_sync(0xffffffff, sum, 2);
+    sum += __shfl_down_sync(0xffffffff, sum, 1);
 
-    // half the step size for each iteration
-    // On each step i, threads with indices less than i add the value 
-    // at index threadIdx.x to the value at threadIdx.x + i
-    for (int i = blockDim.x / 2; i > 0; i /= 2)
+    // initialize shared memory
+    __shared__ float warpLevelSums[32];
+    // calculate landId and WarpId
+    const int warpId = threadIdx.x /32;
+    const int laneId = threadIdx.x % 32;
+    // store the reduced sum for each warp in the shared memory
+    if (laneId == 0)
+        warpLevelSums[warpId] = (warpId < blockDim.x / 32) ? sum : 0.f;
+    
+    __syncthreads();
+
+    // Shuffle the first warp
+    if (warpId == 0)
     {
-        if (threadIdx.x < i)
-        {   
-            input_shared[threadIdx.x] += input_shared[threadIdx.x + i];
-        }
-        __syncthreads(); // Synchronize to make sure all threads are done before the next step
+        sum = warpLevelSums[laneId];
+        sum += __shfl_down_sync(0xffffffff, sum, 16);
+        sum += __shfl_down_sync(0xffffffff, sum, 8);
+        sum += __shfl_down_sync(0xffffffff, sum, 4);
+        sum += __shfl_down_sync(0xffffffff, sum, 2);
+        sum += __shfl_down_sync(0xffffffff, sum, 1);
     }
+
+    
     // Only the first thread in each block writes the final sum to the output array
     if (threadIdx.x == 0)
-        d_output[blockIdx.x] = input_shared[0];
+        d_output[blockIdx.x] = sum;
 }
 
 // Compare two arrays for near-equality; returns true if all elements are nearly the same
@@ -97,7 +113,7 @@ int main()
     dim3 Block(THREAD_PER_BLOCK, 1);
 
     // Launch reduction kernel
-    reduce_v4<<<Grid, Block>>>(d_input, d_output);
+    reduce_v5<<<Grid, Block>>>(d_input, d_output);
 
     // Copy the per-block sums from GPU back to CPU
     cudaMemcpy(output, d_output, block_num * sizeof(float), cudaMemcpyDeviceToHost);

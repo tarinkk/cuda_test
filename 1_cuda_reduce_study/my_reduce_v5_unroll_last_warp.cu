@@ -6,27 +6,35 @@
 
 // Each block will compute the sum (reduce) of its section of the input array.
 // The result from each block is written to the output array.
-__global__ void reduce_v4(float *d_input, float *d_output)
+__global__ void reduce_v5(float *d_input, float *d_output)
 {
     // Find the start of this block's data in the global array
     // subarray_size = 2 * blockDim.x
     float *input_begin = d_input + blockDim.x * blockIdx.x * 2;
     // Initialize shared memory for this block
-    __shared__ float input_shared[THREAD_PER_BLOCK];
+    volatile __shared__ float input_shared[THREAD_PER_BLOCK];
     // Each thread sum two elements from global memory into shared memory
     input_shared[threadIdx.x] = input_begin[threadIdx.x] + input_begin[threadIdx.x + blockDim.x];
     __syncthreads(); // Ensure all threads have written their data to shared memory
 
-    // half the step size for each iteration
-    // On each step i, threads with indices less than i add the value 
-    // at index threadIdx.x to the value at threadIdx.x + i
-    for (int i = blockDim.x / 2; i > 0; i /= 2)
+    for (int i = blockDim.x / 2; i > 32; i /= 2)
     {
         if (threadIdx.x < i)
         {   
             input_shared[threadIdx.x] += input_shared[threadIdx.x + i];
         }
         __syncthreads(); // Synchronize to make sure all threads are done before the next step
+    }
+    // Perform final reduction steps for the first 32 threads using unrolled loop
+    // This avoids synchronization overhead for the last few steps
+    if (threadIdx.x < 32)
+    {
+        input_shared[threadIdx.x] += input_shared[threadIdx.x + 32];
+        input_shared[threadIdx.x] += input_shared[threadIdx.x + 16];
+        input_shared[threadIdx.x] += input_shared[threadIdx.x + 8];
+        input_shared[threadIdx.x] += input_shared[threadIdx.x + 4];
+        input_shared[threadIdx.x] += input_shared[threadIdx.x + 2];
+        input_shared[threadIdx.x] += input_shared[threadIdx.x + 1];
     }
     // Only the first thread in each block writes the final sum to the output array
     if (threadIdx.x == 0)
@@ -97,7 +105,7 @@ int main()
     dim3 Block(THREAD_PER_BLOCK, 1);
 
     // Launch reduction kernel
-    reduce_v4<<<Grid, Block>>>(d_input, d_output);
+    reduce_v5<<<Grid, Block>>>(d_input, d_output);
 
     // Copy the per-block sums from GPU back to CPU
     cudaMemcpy(output, d_output, block_num * sizeof(float), cudaMemcpyDeviceToHost);
