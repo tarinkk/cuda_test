@@ -7,8 +7,10 @@
     - [No Bank Conflict](#no-bank-conflict)
     - [Add During Load](#add-during-load)
     - [Unroll Last Warp](#unroll-last-warp)
+    - [Shuffle](#shuffle)
 
-## CUDA Reduction Kernel:
+2. [SGEMM](#sgemm)
+## CUDA Reduction Kernel
 
 The CUDA kernel performs a parallel reduction operation to compute the sum of elements in an input array. Each block processes a section of the input array, computes the sum of its elements, and writes the result to an output array.
 
@@ -39,6 +41,8 @@ The CUDA kernel performs a parallel reduction operation to compute the sum of el
     - No divergence branch
     - No bank conflict
     - Add during Load
+    - Unroll last warp
+    - Shuffle
 
 3. **Output**:
 
@@ -485,8 +489,8 @@ This strategy stops the generic loop when only a single warp (32 threads) remain
     - Removes the loop-control overhead once only one warp is active.
 
 
-### Unroll Last Warp
-This strategy stops the generic loop when only a single warp (32 threads) remains and finishes the last six steps with hand-unrolled, warp-synchronous additions that need no further barriers.
+### Shuffle
+We can use the shuffle function to achieve the same result. 
 
 1. **Algorithm**
     Given fixed N M and L=2, D is given by.
@@ -531,7 +535,7 @@ This strategy stops the generic loop when only a single warp (32 threads) remain
         warpLevelSums[warpId] = (warpId < D/32) ? sum : 0.f;    
         __syncthreads();
         ```
-    - **Shuffle in Warp again**: `warpId == 0`
+    - **Shuffle in Warp again**: When `warpId == 0`
 
         ```
         sum = warpLevelSums[laneId]
@@ -543,7 +547,12 @@ This strategy stops the generic loop when only a single warp (32 threads) remain
         ```
 
 
+
+
+## SGEMM
+
 ## Reference:
 1. [[CUDA]Reduce规约求和（已完结~）](https://www.bilibili.com/video/BV1HvBSY2EJW?spm_id_from=333.788.videopod.episodes&vd_source=aa41d00aebd84e6f99f529df7f83258a)
 2. [深入浅出GPU优化系列：reduce优化](https://zhuanlan.zhihu.com/p/426978026)
 3. [[CUDA编程]束内洗牌函数 (Warp Shuffle Functions)](https://zhuanlan.zhihu.com/p/669957986)
+4. [cuda 入门的正确姿势：how-to-optimize-gemm](https://zhuanlan.zhihu.com/p/478846788)
