@@ -10,6 +10,9 @@
     - [Shuffle](#shuffle)
 
 2. [SGEMM](#sgemm)
+    - [Baseline](#baseline)
+    - [Shared Memory](#shared-memory)
+    - [Increase Work Per Thread](#increase-work-per-thread)
 ## CUDA Reduction Kernel
 
 The CUDA kernel performs a parallel reduction operation to compute the sum of elements in an input array. Each block processes a section of the input array, computes the sum of its elements, and writes the result to an output array.
@@ -550,9 +553,144 @@ We can use the shuffle function to achieve the same result.
 
 
 ## SGEMM
+We now want to write a kernel to perform single-precision general matrix multiplication
+
+```
+C <- A B
+```
+- A is an M * K matrix
+- B is a K * N matrix
+- C is an M * N matrix
+- all elements are 32-bit floating-point
+
+We adopt the following conventions:
+- D = BLOCK_SIZE
+- (M/D, N/D) = Dim of the 2D grid
+- $C_{I,J}$ = A square tile in C for each block to deal with. I = 0,..., M/D-1, J = 0,..., N/D-1.
+- L = The width and height of each $C_{I,J}$ .
+- (ty,tx) = threadIds in each block: ty = 0,...,D-1, tx = 0,...,D-1
+### Baseline
+Use only global memory
+
+1. **Algorithm**:
+
+    We set L = D, so that each thread (ty,tx) computes one output element $C_{I,J}$[ty,tx].
+
+    The thread - output element mapping is
+
+    ```cuda
+    int x = blockIdx.x * blockDim.x + threadIdx.x;   // global column (N-dim)
+    int y = blockIdx.y * blockDim.y + threadIdx.y;   // global row    (M-dim)
+    ```
+    <br><p align="center">
+    <img src="pictures/image.png" alt="baseline" style="width:60%;">
+
+    Denote $A_I$, the row-block of A required by $C_{I,J}, 
+    and $B_J$, the column-block of B required by $C_{I,J}.
+
+    ```cuda
+    float* A_ptr_start = A_ptr + blockDim.y * blockIdx.y * K;
+    float* B_ptr_start = B_ptr + blockDim.x * blockIdx.x;
+    ```
+
+    Each thread then performs the inner product of its row from $A_I$ and column from $B_J$:
+
+    $C_{I,J} = A_I B_J$
+    ```cuda
+    float temp = 0.f;
+    for (int k = 0; k < K; ++k)
+        temp += A_ptr_start[threadIdx.y * K + k]       // A[y, k]
+              * B_ptr_start[k * N + threadIdx.x];      // B[k, x]
+    C_ptr[y * N + x] = temp;
+    ```
+2. **Discussion**:
+    - Computing a single element of C touches global memory twice for every value of k. 
+    Consequently, the kernel performs 2*M*N*K global-memory accesses.
+    - Compute arithmetic intensity:
+    For one multiply `A[y,k] * B[k,x]` + one add, we need two float operands from global memory.
+    $$
+    I = \frac{2\, \text{FLOP}}{8\, \text{bytes}} = 0.25 \, \text{FLOP}/ \text{bytes}.
+    $$
+    The arithmetic intensity is low compare with modern GPU's peak
+    DRAM bandwith 20 FLOP/byte.
+    This is a **memory-bandwidth-bound** kernel.
+
+### Shared_memory
+1. **Algorithm**:
+    We tile along the K dimension so that every tile fits entirely in shared memory
+
+    Imposing the condition L = D as before, The number of threads is D*D.
+
+    <br><p align="center">
+    <img src="pictures/sgemm_v1.png" alt="Shared_memory" style="width:60%;">
+    
+    Let D<sub>K</sub> be the tile width in the K dimension and N<sub>K</sub> the number of such tiles.
+    Let us the tiles by $A_{I,S}$ and $B_{S,J}$, for S = 0, .. N<sub>K</sub> - 1. 
+
+    Each block computes on $C_{I,J}$ with 
+    
+    $C_{I,J} = A_I B_J = \sum_{L=0}^{N_K -1} A_{I,L} B_{L,J}$.
+    
+    For every tile index S the block perform
+
+    - Load $A_{I,S}$ into shared memory
+    - Load $B_{S,J}$ into shared memory
+    - Compute $A_{I,L} B_{L,J}$ and add the result to $C_{I,J}$
+    
+    Repeating these three steps for N<sub>K</sub> tiles yields the final output block.
+
+    **Load $A_{I,S}$ into shared memory**:
+    
+    For each thread (ty,tx), it should load $A_{I,S}$[ty, tx], $A_{I,S}$[ty, tx + D], ... into the shared memory
+
+    ```cuda
+    __shared__ float a_shared[BLOCK_SIZE][K_TILE_SIZE];
+    // kk local index in each tile
+    // k global index along k dim
+    for (int kk = threadIdx.x; kk < K_TILE_SIZE; kk += BLOCK_SIZE)
+        {
+            int k = kBase + kk;
+            a_shared[threadIdx.y][kk] = (y < M && k < K) ? A_ptr_start[threadIdx.y * K + k] : 0.0f;
+        }
+    ```
+
+    **Load $B_{S,J}$ into shared memory**:
+    For each thread (ty,tx), it should load $B_{S,J}$[ty, tx], $B_{S,J}$[ty + D, tx], ... into the shared memory
+
+    ```cuda
+    __shared__ float b_shared[K_TILE_SIZE][BLOCK_SIZE];
+    for (int kk = threadIdx.y; kk < K_TILE_SIZE; kk += BLOCK_SIZE)
+        {
+            int k = kBase + kk;
+            b_shared[kk][threadIdx.x] = (k < K && x < N) ? B_ptr_start[k * N + threadIdx.x] : 0.0f;
+
+        }
+    __syncthreads();
+
+    ```
+    **Compute $A_{I,L} B_{L,J}$ and add the result to $C_{I,J}$**
+
+    ```cuda
+    for (int kk = 0; kk < K_TILE_SIZE; kk++)
+        {
+            C_ptr[y * N + x] += a_shared[threadIdx.y][kk] * b_shared[kk][threadIdx.x];
+        }
+        __syncthreads(); // avoid data hazard before next load
+    ```
+
+2. **Discussion**:
+    - Global memory traffic: 2 * K / `BLOCK_SIZE` * M * N. `BLOCK_SIZE` fewer than the baseline.
+    - Thread work per block: 1 × BLOCK_SIZE² × K FMA. The same as baseline but with locality
+    - Arithmetic intensity: I = BLOCK_SIZE * 0.25 FLOP/byte, where 0.25 is the arithmetic intensity of bathline. v1 drastically reduces DRAM traffic per arithmetic operation.
+    - Although `K_TILE_SIZE` doesn't affect the arithmetic intensity. the proper choice of `K_TILE_SIZE` is still essential. Tiny tiles will flood the schedule with barriers and load loops – the kernel becomes latency-bound again. While huge tiles will force the GPU to run one block per SM. Throughput then drops because stalls in one block can’t be hidden by another.
+
+
+### Increase Work Per Thread
+
 
 ## Reference:
 1. [[CUDA]Reduce规约求和（已完结~）](https://www.bilibili.com/video/BV1HvBSY2EJW?spm_id_from=333.788.videopod.episodes&vd_source=aa41d00aebd84e6f99f529df7f83258a)
 2. [深入浅出GPU优化系列：reduce优化](https://zhuanlan.zhihu.com/p/426978026)
 3. [[CUDA编程]束内洗牌函数 (Warp Shuffle Functions)](https://zhuanlan.zhihu.com/p/669957986)
 4. [cuda 入门的正确姿势：how-to-optimize-gemm](https://zhuanlan.zhihu.com/p/478846788)
+5. [深入浅出GPU优化系列：GEMM优化（一）](https://zhuanlan.zhihu.com/p/435908830)

@@ -1,7 +1,7 @@
-#include <cstdio>               // printf
-#include <cuda.h>
-#include <stdlib.h>             // malloc, free, drand48, abs
-#include <cuda_runtime.h>       // cudaMalloc, cudaMemcpy
+#include <cstdio>             // printf
+#include <cuda.h>              
+#include <stdlib.h>           // malloc, free, drand48, abs
+#include <cuda_runtime.h>     // cudaMalloc, cudaMemcpy
 
 // Utility: Fill a host matrix with random numbers in the range [-1, 1]
 void random_matrix(int M, int N, float *A_ptr)
@@ -14,7 +14,7 @@ void random_matrix(int M, int N, float *A_ptr)
 }
 
 // Reference SGEMM on CPU: triple-nested loop (O(M.N.K))
-void cpu_sgemm(float *A_ptr, float *B_ptr, float *C_ptr, int M, int N, int K)
+void cpu_sgemm_v0(float *A_ptr, float *B_ptr, float *C_ptr, int M, int N, int K)
 {
     for (int m = 0; m < M; m++)
         for(int n = 0; n < N; n++)
@@ -42,77 +42,50 @@ float compare_matrices(int M, int N, float *C_gpu, float *C_cpu)
         }
     return max_diff;
 }
-template <unsigned int BLOCK_SIZE, unsigned int K_TILE_SIZE>
-__global__ void cuda_sgemm_v1(float *A_ptr, float *B_ptr, float *C_ptr, const int M, const int N, const int K)
+
+// Naïve CUDA SGEMM kernel (no tiling / shared memory, purely register compute).
+// Each thread computes one element of the output matrix C.
+//   Grid : ceil(N / BLOCK) × ceil(M / BLOCK)
+//   Block: BLOCK × BLOCK threads (2D grid)
+__global__ void cuda_sgemm_v0(float *A_ptr, float *B_ptr, float *C_ptr, const int M, const int N, const int K)
 {
-    // Thread <-> output element mapping
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= N || y >= M) return; //boundary check
+    // Global coordinates of the thread in output matrix C.
+    const int x = blockIdx.x * blockDim.x + threadIdx.x; // column n
+    const int y = blockIdx.y * blockDim.y + threadIdx.y; // row    m
+
+    // Bounds check: skip out-of-range threads (when N or M not divisible by BLOCK).
+    if (x >= N || y >= M) return;
 
     // Pointers to the start of the A and B matrices for this block.
     float *A_ptr_start = A_ptr + blockDim.y * blockIdx.y * K;
     float *B_ptr_start = B_ptr + blockDim.x * blockIdx.x;
 
-    // shared memory tiles
-    __shared__ float a_shared[BLOCK_SIZE][K_TILE_SIZE];
-    __shared__ float b_shared[K_TILE_SIZE][BLOCK_SIZE];
+    float temp = 0.f; // accumulator in register
 
-    // running sum for C[y][x]
-    float temp = 0.f;
-
-    // Total number of K tiles (ceil division)
-    const int NUM_TILES = (K + K_TILE_SIZE - 1) / K_TILE_SIZE;
-
-    // Loop over K tiles
-    for (int tile = 0; tile < NUM_TILES; ++tile)
-    {  
-        const int kBase = tile * K_TILE_SIZE; // starting K index of this tile
-        
-        // Load of A tile
-        // Each thread loads elements (y, kBase + kk)
-        // kk is the local index within the tile
-        for (int kk = threadIdx.x; kk < K_TILE_SIZE; kk += BLOCK_SIZE)
-        {
-            int k = kBase + kk;
-            a_shared[threadIdx.y][kk] = (y < M && k < K) ? A_ptr_start[threadIdx.y * K + k] : 0.0f;
-        }
-
-        // Load of B tile
-        for (int kk = threadIdx.y; kk < K_TILE_SIZE; kk += BLOCK_SIZE)
-        {
-            int k = kBase + kk;
-            b_shared[kk][threadIdx.x] = (k < K && x < N) ? B_ptr_start[k * N + threadIdx.x] : 0.0f;
-        }
-
-        __syncthreads();   // ensures tiles fully populated
-
-        // Compute the partial dot product for this tile
-        for (int k = 0; k < K_TILE_SIZE; k++)
-        {
-            temp += a_shared[threadIdx.y][k] * b_shared[k][threadIdx.x];
-        }
-        __syncthreads(); // avoid data hazard before next load
-    }
-    
-    if (y < M && x < N)
+    // Compute the dot product for the (x,y) element of C.
+    // The code is structured to emphasize per-block execution.
+    for (int k = 0; k < K; k++)
     {
-        // Store the result in C
-        C_ptr[y * N + x] += temp;
+        temp += A_ptr_start[threadIdx.y * K + k] * B_ptr_start[k * N + threadIdx.x];
     }
+
+    // Store result.
+    C_ptr[y * N + x] = temp;
 }
 
 int main()
 {
     // Matrix sizes
-    int M = 512;
-    int N = 512;
-    int K = 512;
+    const int M = 512;
+    const int N = 512;
+    const int K = 512;
+    printf("Matrix sizes: M = %d, N = %d, K = %d\n", M, N, K);
 
     // Host memory allocation
     const size_t mem_size_A = M * K * sizeof(float);
     const size_t mem_size_B = K * N * sizeof(float);
     const size_t mem_size_C = M * N * sizeof(float);
+    
     float *matrix_A_host = (float *)malloc(mem_size_A);
     float *matrix_B_host = (float *)malloc(mem_size_B);
     float *matrix_C_host_gpu_calc = (float *)malloc(mem_size_C);
@@ -140,17 +113,14 @@ int main()
     printf("Data copied to device.\n");
 
     // CPU (reference) computation
-    cpu_sgemm(matrix_A_host, matrix_B_host, matrix_C_host_cpu_calc, M, N, K);
+    cpu_sgemm_v0(matrix_A_host, matrix_B_host, matrix_C_host_cpu_calc, M, N, K);
     printf("CPU SGEMM completed.\n");
     
     // Launch GPU SGEMM kernel
-    constexpr int BLOCK_SIZE = 16;
-    // for simplicity, we assume K are multiple of K_TILE_SIZE and K_TILE_SIZE is a multiple of BLOCK_SIZE
-    constexpr int K_TILE_SIZE = 32;
-
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 grid((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    cuda_sgemm_v1<BLOCK_SIZE, K_TILE_SIZE><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, M, N, K);
+    constexpr int BLOCK = 16; // 16 * 16 = 256 threads per block
+    dim3 block(BLOCK, BLOCK);
+    dim3 grid((N + BLOCK - 1) / BLOCK, (M + BLOCK - 1) / BLOCK);
+    cuda_sgemm_v0<<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, M, N, K);
     printf("GPU SGEMM kernel launched.\n");
 
     // Retrieve result from GPU
