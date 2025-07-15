@@ -13,6 +13,7 @@
     - [Baseline](#baseline)
     - [Shared Memory](#shared-memory)
     - [Increase Work Per Thread](#increase-work-per-thread)
+    - [Using Float4](#using-float4)
 ## CUDA Reduction Kernel
 
 The CUDA kernel performs a parallel reduction operation to compute the sum of elements in an input array. Each block processes a section of the input array, computes the sum of its elements, and writes the result to an output array.
@@ -644,7 +645,6 @@ Use only global memory
     For each thread (ty,tx), it should load $A_{I,S}$[ty, tx], $A_{I,S}$[ty, tx + D], ... into the shared memory
 
     ```cuda
-    __shared__ float a_shared[BLOCK_SIZE][K_TILE_SIZE];
     // kk local index in each tile
     // k global index along k dim
     for (int kk = threadIdx.x; kk < K_TILE_SIZE; kk += BLOCK_SIZE)
@@ -658,7 +658,6 @@ Use only global memory
     For each thread (ty,tx), it should load $B_{S,J}$[ty, tx], $B_{S,J}$[ty + D, tx], ... into the shared memory
 
     ```cuda
-    __shared__ float b_shared[K_TILE_SIZE][BLOCK_SIZE];
     for (int kk = threadIdx.y; kk < K_TILE_SIZE; kk += BLOCK_SIZE)
         {
             int k = kBase + kk;
@@ -686,6 +685,82 @@ Use only global memory
 
 
 ### Increase Work Per Thread
+
+1. **Algorithm**:
+
+    We now set L = s D, so that each thread (ty,tx) computes $s^2$ output element $C_{I,J}$[ty + i D,tx + jD] with i = 0,...,s-1; j = 0,...,s-1.
+
+    <br><p align="center">
+    <img src="pictures/sgemm_v2.png" alt="increase_work_per_thread" style="width:80%;">
+
+
+    For fixed I, J and S, we first
+
+    **Load $A_{I,S}$ into shared memory**:
+    
+    For each thread (ty,tx), it should load $A_{I,S}$[yy, kk] into the shared memory
+    - (yy, kk): local indice for $A_{I,S}$
+    - yy = threadIdx.y; yy += D; yy < L;
+    - kk = threadIdx.x; xx += D; kk < D<sub>K</sub>;
+
+    ```
+    for (int kk = tx; kk < K_TILE_SIZE; kk += blockDim.x)
+            for (int yy = ty; yy < C_TILE_SIZE; yy += blockDim.y)
+            {
+                int k = kBase + kk;
+                int y = yBase + yy;
+                a_shared[yy][kk] = (y < M && k < K) ? A_ptr_start[yy * K + k] : 0.0f;
+            }
+    ```
+
+    **Load $B_{S,J}$ into shared memory**:
+
+    Each thread (ty, tx) will load $B_{S,J}$[kk, xx] into the shared memory
+    - (kk, xx): local indice for $B_{S,J}$
+    - kk = threadIdx.y; kk += D; kk < D<sub>K</sub>;
+    - xx = threadIdx.x; xx += D; xx < L;
+
+    ```cuda
+    for (int kk = threadIdx.y; kk < K_TILE_SIZE; kk += blockDim.y) 
+            for (int xx = tx; xx < C_TILE_SIZE; xx += blockDim.x)
+            {
+                int k = kBase + kk;
+                int x = xBase + xx;
+                b_shared[kk][xx] = (k < K && x < N) ? B_ptr_start[k * N + xx] : 0.0f; 
+            }
+    ```
+
+    **Compute $A_{I,L} B_{L,J}$ and add the result to $C_{I,J}$**
+
+    Each thread (ty, tx) will compute $A_{I,L}$[yy,kk]$B_{L,J}$[kk][xx] and accumulate the result in $C_{I,J}[yy,xx]$
+    
+    - yy = ty, ty < L, ty += D
+    - xx = tx, tx < L, tx += D
+    - kk = 0, kk < D<sub>K</sub>, ++k
+
+    ```cuda
+    for (int kk = 0; kk < K_TILE_SIZE; ++kk)
+            for (int ry = 0; ry < STRIDE; ++ry)
+                for (int cx = 0; cx < STRIDE; ++cx)
+                {
+                    int yy = ty + ry * blockDim.y;
+                    int xx = tx + cx * blockDim.x;
+                    temp[ry][cx] += a_shared[yy][kk] * b_shared[kk][xx]; 
+                }
+        __syncthreads(); // avoid data hazard before next load
+    ```
+
+
+2. **Discussion**:
+    - Global memory access ber block (ber thread) increases by s.
+    - Thread work per block (ber thread) inceases by s^2.
+    - The arithmetic intensity will increase by s, turning it from memory‑bound (v1) into a far more compute‑balanced kernel.
+
+### Using Float4
+1. **Algorithm**
+
+    <br><p align="center">
+    <img src="pictures/sgemm_v3.png" alt="using float4" style="width:60%;">
 
 
 ## Reference:
