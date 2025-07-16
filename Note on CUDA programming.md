@@ -14,6 +14,7 @@
     - [Shared Memory](#shared-memory)
     - [Increase Work Per Thread](#increase-work-per-thread)
     - [Using Float4](#using-float4)
+    - [Register Outer Product](#register-outer-product)
 ## CUDA Reduction Kernel
 
 The CUDA kernel performs a parallel reduction operation to compute the sum of elements in an input array. Each block processes a section of the input array, computes the sum of its elements, and writes the result to an output array.
@@ -630,13 +631,13 @@ Use only global memory
 
     Each block computes on $C_{I,J}$ with 
     
-    $C_{I,J} = A_I B_J = \sum_{L=0}^{N_K -1} A_{I,L} B_{L,J}$.
+    $C_{I,J} = A_I B_J = \sum_{S=0}^{N_K -1} A_{I,S} B_{S,J}$.
     
     For every tile index S the block perform
 
     - Load $A_{I,S}$ into shared memory
     - Load $B_{S,J}$ into shared memory
-    - Compute $A_{I,L} B_{L,J}$ and add the result to $C_{I,J}$
+    - Compute $A_{I,S} B_{S,J}$ and add the result to $C_{I,J}$
     
     Repeating these three steps for N<sub>K</sub> tiles yields the final output block.
 
@@ -667,7 +668,7 @@ Use only global memory
     __syncthreads();
 
     ```
-    **Compute $A_{I,L} B_{L,J}$ and add the result to $C_{I,J}$**
+    **Compute $A_{I,S} B_{S,J}$ and add the result to $C_{I,J}$**
 
     ```cuda
     for (int kk = 0; kk < K_TILE_SIZE; kk++)
@@ -730,9 +731,9 @@ Use only global memory
             }
     ```
 
-    **Compute $A_{I,L} B_{L,J}$ and add the result to $C_{I,J}$**
+    **Compute $A_{I,S} B_{S,J}$ and add the result to $C_{I,J}$**
 
-    Each thread (ty, tx) will compute $A_{I,L}$[yy,kk]$B_{L,J}$[kk][xx] and accumulate the result in $C_{I,J}[yy,xx]$
+    Each thread (ty, tx) will compute $A_{I,S}$[yy,kk]$B_{S,J}$[kk][xx] and accumulate the result in $C_{I,J}$[yy,xx]
     
     - yy = ty, ty < L, ty += D
     - xx = tx, tx < L, tx += D
@@ -757,12 +758,186 @@ Use only global memory
     - The arithmetic intensity will increase by s, turning it from memory‑bound (v1) into a far more compute‑balanced kernel.
 
 ### Using Float4
+
+We use Float4 to pick 4 floats in a row at a time.
+
 1. **Algorithm**
+    
+    We set L = D<sub>M</sub> = 4D<sub>N</sub> and we need to assume the condition D<sub>K</sub> is a multiple of 4.
 
     <br><p align="center">
     <img src="pictures/sgemm_v3.png" alt="using float4" style="width:60%;">
 
+    **Load $A_{I,S}$ into shared memory**:
+    
+    For each thread (ty,tx), it should load $A_{I,S}$[yy, kk] into the shared memory
+    - (yy, kk): local indice for $A_{I,S}$
+    - yy = threadIdx.y;
+    - kkBase = 4 * threadIdx.x; kkBase += D<sub>M</sub>; kkBase < D<sub>K</sub>;
+    - kk = kkBase + i, i = 0,1,2,3
 
+    ```cuda
+    for (int kk = 4 * tx; kk < K_TILE_SIZE; kk += NUM_PER_THREAD * blockDim.x)
+        {
+            int k = kBase + kk;     //global k-index in A
+            int y = yBase + ty;     //global y-index in A
+            if (k < K && y < M)
+                FETCH_FLOAT4(a_shared[ty][kk]) = FETCH_FLOAT4(A_ptr[y * K + k]);
+        } 
+    ```
+
+    **Load $B_{S,J}$ into shared memory**:
+
+    Each thread (ty, tx) will load $B_{S,J}$[kk, xx] into the shared memory
+    - (kk, xx): local indice for $B_{S,J}$
+    - kk = threadIdx.y; kk += D<sub>M</sub>; kk < D<sub>K</sub>;
+    - xxBase = 4*threadIdx.x;
+    - xx = xxBase + i, i = 0,1,2,3
+
+    ```
+    for (int kk = ty; kk < K_TILE_SIZE; kk += blockDim.y) 
+        {
+            int xx = 4 * tx;        // Local col in B tile
+            int k = kBase + kk;     // global k-index in B
+            int x = xBase + xx;     // global x-index in B
+            if (k < K && x < N)
+                FETCH_FLOAT4(b_shared[kk][xx]) = FETCH_FLOAT4(B_ptr[k * N + x]); 
+        }
+    ```
+
+    **Compute $A_{I,S} B_{S,J}$ and add the result to $C_{I,J}$**
+
+    Each thread (ty, tx) will compute $A_{I,S}$[yy,kk]$B_{S,J}$[kk][xx] and accumulate the result in $C_{I,J}$[yy,xx]
+    
+    - yy = ty
+    - xxBase = 4*tx
+    - xx = xxBase + i, i = 0, 1, 2, 3.
+    - kk = 0, kk < D<sub>K</sub>, ++k
+    
+    ```cuda
+    for (int kk = 0; kk < K_TILE_SIZE; ++kk)
+            for (int i = 0; i < NUM_PER_THREAD; ++i)
+                {
+                    int yy = ty;
+                    int xx = 4 * tx + i;
+                    int x = xBase + xx;
+                    int y = yBase + yy;
+                    int k = kBase + kk;
+                    if (k < K && y < M && x < N)
+                        temp[i] += a_shared[yy][kk] * b_shared[kk][xx]; 
+                }
+        __syncthreads(); // avoid data hazard before next load
+    ```
+
+2. **Discussions**:
+    - vectorised global loads: `FETCH_FLOAT4` turns four independent 32‑bit loads into one 128‑bit load. The compiler therefore generates 1/4 the number of memory‑op instructions for the same data volume. The win comes from instruction‑side efficiency (issue bandwidth, I‑cache, address ALU) and from letting the warp reach the compute phase with fewer cycles stalled on memory.
+    - The arithmetic intensity (per block) is the same as v2 when s = 2.
+
+### Register Outer Product
+1. **Algorithm**:
+
+    We set L<sub>M</sub> = 4D<sub>M</sub>, L<sub>N</sub> = 4D<sub>N</sub> and assume D<sub>K</sub>  is a multiple of 4.
+
+    The shared memory is of the size
+    - A_shared: (D<sub>M</sub>, D<sub>K</sub>)
+    - B_shared: (D<sub>K</sub>, D<sub>N</sub>)
+
+    As usual, we do the tiling via
+
+    $C_{I,J} = A_I B_J = \sum_{S=0}^{N_K -1} A_{I,S} B_{S,J}$.
+
+    $A_{I,S}$, $B_{S,J}$ are put to the shared memory before the computation.
+
+    **Load $A_{I,S}$ into shared memory**:
+    
+    For each thread (ty,tx), it should load $A_{I,S}$[yy, kk] into the shared memory
+    - (yy, kk): local indice for $A_{I,S}$
+    - yy = 4 * threadIdx.y + i, i = 0,1,2,3;
+    - kkBase = 4 * threadIdx.x; kkBase += L<sub>M</sub>; kkBase < L<sub>K</sub>;
+    - kk = kkBase + i, i = 0,1,2,3
+
+    ```cuda
+    for (int kk = 4 * tx; kk < K_TILE_SIZE; kk += N_TILE_SIZE)
+        for (int i = 0; i < NUM_PER_THREAD; ++i)
+        {
+            int k = kBase + kk;         //global k-index in A
+            int yy = 4 * ty + i;        // Local row in A tile
+            int y = yBase + yy;     //global y-index in A
+            if (k < K && y < M)
+                FETCH_FLOAT4(a_shared[yy][kk]) = FETCH_FLOAT4(A_ptr[y * K + k]);
+        }
+    ```
+
+    **Load $B_{S,J}$ into shared memory**:
+
+    Each thread (ty, tx) will load $B_{S,J}$[kk, xx] into the shared memory
+    - (kk, xx): local indice for $B_{S,J}$
+    - kkBase = 4*threadIdx.y; kkBase += L<sub>M</sub>; kkBase < L<sub>K</sub>;
+    - kk = kkBase + i, i = 0,1,2,3
+    - xx = 4*threadIdx.x + i, i = 0,1,2,3
+
+    ```cuda
+    for (int kkBase = 4 * ty; kkBase < K_TILE_SIZE; kkBase += M_TILE_SIZE) 
+        for (int i = 0; i < NUM_PER_THREAD; ++i)
+        {
+            int xx = 4 * tx;
+            int x = xBase + xx;
+            int kk = kkBase + i;
+            int k = kBase + kk;
+            if (k < K && x < N)
+                FETCH_FLOAT4(b_shared[kk][xx]) = FETCH_FLOAT4(B_ptr[k * N + x]);
+
+        }
+    ```
+
+    After $A_{I,S}$, $B_{S,J}$ been stored in the
+    shared memory, we can further split $A_{I,S}$ by column and split $B_{S,J}$ by row.
+
+    <br><p align="center">
+    <img src="pictures/sgemm_v4.png" alt="register outer product" style="width:60%;">
+
+    $A_{I,S} B_{S,J} = \sum_{kk} A_{I,S}[:,kk] \otimes B_{S,J}[kk,:]$
+    
+    We can partition $A_{I,S}[:,kk]$ into D<sub>M</sub> col vectors of length 4, and denote it by 
+    
+    $A_{I,S, ty, kk} = A_{I,S}[4*ty:4*ty+4,kk]$.
+
+    Similarly we partition $B_{S,J}[kk,:]$ into D<sub>N</sub> row
+    vectors of length 4 and denote it by 
+    
+    $B_{S,J,kk,tx} = B_{S,J}[kk, 4 * tx : 4 * tx + 4]$.
+
+    Each thread (ty, tx) loads $A_{I,S, ty, kk}$ and $B_{S,J,kk,tx}$
+    to the register and do the outer product
+
+    $C_{I,J}[yy, xx] += A_{I,S, ty, kk}[i]*B_{S,J,kk,tx}[j]$
+
+    where 
+    - yy = 4 * ty + i
+    - xx = 4 * tx + j
+
+    ```cuda
+    for (int kk = 0; kk < K_TILE_SIZE; ++kk)
+    {
+        // load a_reg and b_reg 
+        a_reg[0] = a_shared[4 * ty][kk];
+        a_reg[1] = a_shared[4 * ty + 1][kk];
+        a_reg[2] = a_shared[4 * ty + 2][kk];
+        a_reg[3] = a_shared[4 * ty + 3][kk];
+        FETCH_FLOAT4(b_reg[0]) = FETCH_FLOAT4(b_shared[kk][4 * tx]);
+        // outer product
+        for (int i = 0; i < NUM_PER_THREAD; ++i)
+            for (int j = 0; j < NUM_PER_THREAD; ++j)
+            {
+                temp[i][j] += a_reg[i] * b_reg[j];
+            }
+
+    }
+    ```
+
+2. Discussion
+    - Register‑blocked outer product (4 × 4) multiplies useful math per shared‑mem access.
+    - Dual‑vectorised loads (float4 for both A & B) cut the LD/ST instruction count roughly in half.
 ## Reference:
 1. [[CUDA]Reduce规约求和（已完结~）](https://www.bilibili.com/video/BV1HvBSY2EJW?spm_id_from=333.788.videopod.episodes&vd_source=aa41d00aebd84e6f99f529df7f83258a)
 2. [深入浅出GPU优化系列：reduce优化](https://zhuanlan.zhihu.com/p/426978026)
