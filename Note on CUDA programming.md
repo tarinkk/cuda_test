@@ -890,6 +890,8 @@ We use Float4 to pick 4 floats in a row at a time.
         }
     ```
 
+    **Compute $A_{I,S} B_{S,J}$**:
+
     After $A_{I,S}$, $B_{S,J}$ been stored in the
     shared memory, we can further split $A_{I,S}$ by column and split $B_{S,J}$ by row.
 
@@ -938,6 +940,61 @@ We use Float4 to pick 4 floats in a row at a time.
 2. Discussion
     - Register‑blocked outer product (4 × 4) multiplies useful math per shared‑mem access.
     - Dual‑vectorised loads (float4 for both A & B) cut the LD/ST instruction count roughly in half.
+
+### A Shared Memory Transpose
+1. **Algorithm**:
+        We set L<sub>M</sub> = 4D<sub>M</sub>, L<sub>N</sub> = 4D<sub>N</sub> and assume D<sub>K</sub>  is a multiple of 4, the same as the last version
+
+    We transpose A shared memory, so that we could use float4 instructions during computations 
+    - A_shared: (D<sub>K</sub>, D<sub>M</sub>)
+    - B_shared: (D<sub>K</sub>, D<sub>N</sub>)
+
+    **Load $A_{I,S}$ into shared memory**:
+
+    For each thread (ty,tx), it should load $A_{I,S}$[yy, kk] into the shared memory
+    $A^\text{shared}_{S,I}[kk, yy]$
+    - (yy, kk): local indice for $A_{I,S}$
+    - yy = 4 * threadIdx.y + i, i = 0,1,2,3;
+    - kkBase = 4 * threadIdx.x; kkBase += L<sub>M</sub>; kkBase < L<sub>K</sub>;
+    - kk = kkBase + i, i = 0,1,2,3
+
+    **Load $B_{S,J}$ into shared memory**:
+
+    We didn't apply transpose to B shared memory
+    Each thread (ty, tx) will load $B_{S,J}$[kk, xx] into the shared memory load $B^\text{shared}_{S,J}$[kk, xx]
+    - (kk, xx): local indice for $B_{S,J}$
+    - kkBase = 4*threadIdx.y; kkBase += L<sub>M</sub>; kkBase < L<sub>K</sub>;
+    - kk = kkBase + i, i = 0,1,2,3
+    - xx = 4*threadIdx.x + i, i = 0,1,2,3
+
+    **Compute $A_{I,S} B_{S,J}$**:
+    
+    From shared memory, we have
+
+    $A_{I,S} B_{S,J} = \sum_{kk} A^\text{shared}_{S,I}[kk,:] \otimes B^\text{shared}_{S,J}[kk,:]$
+    
+    We can partition $A^\text{shared}_{S,I}[:,kk]$ into D<sub>M</sub> **row** vectors of length 4, and denote it by 
+    
+    $A^\text{shared}_{S,I, kk, ty} = A^\text{shared}_{S,I}[kk, 4*ty:4*ty+4]$.
+
+    Similarly we partition $B^\text{shared}_{S,J}[kk,:]$ into D<sub>N</sub> row
+    vectors of length 4 and denote it by 
+    
+    $B^\text{shared}_{S,J,kk,tx} = B^\text{shared}_{S,J}[kk, 4 * tx : 4 * tx + 4]$.
+
+    Each thread (ty, tx) loads $A^\text{shared}_{S,I,kk,ty}$ and $B^\text{shared}_{S,J,kk,tx}$ 
+    to the register by using float4 and do the outer product
+
+    $C_{I,J}[yy, xx] += A^\text{shared}_{S,I,kk,ty}[i]*B^\text{shared}_{S,J,kk,tx}[j]$
+
+    where 
+    - yy = 4 * ty + i
+    - xx = 4 * tx + j
+
+    
+
+
+
 ## Reference:
 1. [[CUDA]Reduce规约求和（已完结~）](https://www.bilibili.com/video/BV1HvBSY2EJW?spm_id_from=333.788.videopod.episodes&vd_source=aa41d00aebd84e6f99f529df7f83258a)
 2. [深入浅出GPU优化系列：reduce优化](https://zhuanlan.zhihu.com/p/426978026)
