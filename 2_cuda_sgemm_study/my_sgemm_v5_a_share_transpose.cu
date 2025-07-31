@@ -43,13 +43,15 @@ float compare_matrices(int M, int N, float *C_gpu, float *C_cpu)
     return max_diff;
 }
 
+#define OFFSET(row, col, ld) ((row) * (ld) + (col))
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4 *>(&(pointer))[0])
 
 template <unsigned int N_TILE_SIZE,
           unsigned int M_TILE_SIZE,
           unsigned int K_TILE_SIZE, 
-          unsigned int NUM_PER_THREAD>
-__global__ void cuda_sgemm_v4(float *A_ptr, float *B_ptr, float *C_ptr, int M, int N, int K)
+          unsigned int N_PER_THREAD,
+          unsigned int M_PER_THREAD>
+__global__ void cuda_sgemm_v5(float *A_ptr, float *B_ptr, float *C_ptr, int M, int N, int K)
 {
     // Thread & block coordinates
     const int tx = threadIdx.x;                 // local column id inside the block 
@@ -58,88 +60,122 @@ __global__ void cuda_sgemm_v4(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
     const int yBase = blockIdx.y * M_TILE_SIZE; // global row of block’s top edge
 
     // shared memory staging buffers
-    __shared__ float a_shared[M_TILE_SIZE][K_TILE_SIZE];
+    __shared__ float a_shared[K_TILE_SIZE][M_TILE_SIZE];
     __shared__ float b_shared[K_TILE_SIZE][N_TILE_SIZE];
 
     // per-thread accumulator
-    float temp[NUM_PER_THREAD][NUM_PER_THREAD] = {0.0};
-
-    float a_reg[NUM_PER_THREAD]; // register for A tile
-    float b_reg[NUM_PER_THREAD]; // register for B tile
+    float temp[M_PER_THREAD][N_PER_THREAD] = {0.0};
+    float r_load_a[4];
+    float r_comp_a[M_PER_THREAD]; 
+    float r_comp_b[N_PER_THREAD];
 
     // Total number of K tiles (ceil division)
     const int NUM_TILES = (K + K_TILE_SIZE - 1) / K_TILE_SIZE;
 
-    // Loop over K tiles
+    // 1D threadID
+    const int tid = ty * blockDim.x + tx;
+    
+    // how many float4 each thread will load
+    const int F4_PER_THREAD_a = (M_TILE_SIZE * K_TILE_SIZE + 4 * blockDim.x * blockDim.y - 1) / (4 * blockDim.x * blockDim.y);
+    const int F4_PER_THREAD_b = (K_TILE_SIZE * M_TILE_SIZE + 4 * blockDim.x * blockDim.y - 1) / (4 * blockDim.x * blockDim.y); 
+
+    // step size for loading A and B
+    const int STEP_LOAD_a = 4 * blockDim.x * blockDim.y / K_TILE_SIZE;
+    const int STEP_LOAD_b = 4 * blockDim.x * blockDim.y / N_TILE_SIZE;
+
+    // Loading address for A and B (initially)
+    int load_a_smem_m = tid / (K_TILE_SIZE / 4);
+    int load_a_smem_k = (tid % (K_TILE_SIZE / 4)) * 4;
+    int load_b_smem_k = tid / (N_TILE_SIZE / 4);
+    int load_b_smem_n = (tid % (N_TILE_SIZE / 4)) * 4;
+
+    // step size for computing A and B
+    int comp_a_step_m = 4 * blockDim.x; 
+    int comp_b_step_n = 4 * blockDim.y;
+    int comp_a_NUM_m = M_TILE_SIZE / comp_a_step_m;
+    int comp_b_NUM_n = N_TILE_SIZE / comp_b_step_n;
+
+
+    // Load A and B tiles into shared memory
     for (int tile = 0; tile < NUM_TILES; ++tile)
     {  
-        const int kBase = tile * K_TILE_SIZE; // starting K index of this tile
+        int kBase = tile * K_TILE_SIZE; // starting K index of this tile
         
-        // Load A tile
-        for (int kk = 4 * tx; kk < K_TILE_SIZE; kk += N_TILE_SIZE)
-            for (int i = 0; i < NUM_PER_THREAD; ++i)
-            {
-                int k = kBase + kk;         //global k-index in A
-                int yy = 4 * ty + i;        // Local row in A tile
-                int y = yBase + yy;     //global y-index in A
-                if (k < K && y < M)
-                    FETCH_FLOAT4(a_shared[yy][kk]) = FETCH_FLOAT4(A_ptr[y * K + k]);
-            }  
+        // Load A tile into shared memory
+        for (int N_F4 =0; N_F4 < F4_PER_THREAD_a; ++N_F4)
+        {
+            int yy = load_a_smem_m + N_F4 * STEP_LOAD_a;
+            int y = yBase + yy; 
+            int k = kBase + load_a_smem_k;
+            int load_a_gmem_addr = OFFSET(y, k, K);
+            FETCH_FLOAT4(r_load_a[0]) = FETCH_FLOAT4(A_ptr[load_a_gmem_addr]);
+            a_shared[load_a_smem_k][yy] = r_load_a[0];
+            a_shared[load_a_smem_k + 1][yy] = r_load_a[1];
+            a_shared[load_a_smem_k + 2][yy] = r_load_a[2];
+            a_shared[load_a_smem_k + 3][yy] = r_load_a[3];
+        }
 
-        // Load B tile
-        for (int kkBase = 4 * ty; kkBase < K_TILE_SIZE; kkBase += M_TILE_SIZE) 
-            for (int i = 0; i < NUM_PER_THREAD; ++i)
-            {
-                int xx = 4 * tx;
-                int x = xBase + xx;
-                int kk = kkBase + i;
-                int k = kBase + kk;
-                if (k < K && x < N)
-                    FETCH_FLOAT4(b_shared[kk][xx]) = FETCH_FLOAT4(B_ptr[k * N + x]);
-
-            }
+        // Load B tile into shared memory
+        for (int M_F4 =0; M_F4 < F4_PER_THREAD_b; ++M_F4)
+        {
+            int kk = load_b_smem_k + M_F4 * STEP_LOAD_b; 
+            int k = kBase + kk;
+            int x = xBase + load_b_smem_n;
+            int load_b_gmem_addr = OFFSET(k, x, N);
+            FETCH_FLOAT4(b_shared[kk][load_b_smem_n]) = FETCH_FLOAT4(B_ptr[load_b_gmem_addr]);
+        }
 
         __syncthreads();   // ensures tiles fully populated
 
         // Compute the outer product for this tile
         for (int kk = 0; kk < K_TILE_SIZE; ++kk)
         {
-            // load a_reg and b_reg 
-            a_reg[0] = a_shared[4 * ty][kk];
-            a_reg[1] = a_shared[4 * ty + 1][kk];
-            a_reg[2] = a_shared[4 * ty + 2][kk];
-            a_reg[3] = a_shared[4 * ty + 3][kk];
-            FETCH_FLOAT4(b_reg[0]) = FETCH_FLOAT4(b_shared[kk][4 * tx]);
-            // outer product
-            for (int i = 0; i < NUM_PER_THREAD; ++i)
-                for (int j = 0; j < NUM_PER_THREAD; ++j)
+            for (int i = 0; i < comp_a_NUM_m; ++i)
+                for(int j = 0; j < comp_b_NUM_n; ++j)
                 {
-                    temp[i][j] += a_reg[i] * b_reg[j];
+                    int yy = 4 * ty + i * comp_a_step_m;
+                    int xx = 4 * tx + j * comp_b_step_n; 
+                    FETCH_FLOAT4(r_comp_a[4 * i]) = FETCH_FLOAT4(a_shared[kk][yy])
+                    FETCH_FLOAT4(r_comp_b[4 * j]) = FETCH_FLOAT4(b_shared[kk][xx])
+                }
+            
+            for (int tm = 0; tm < M_PER_THREAD; ++tm)
+                for (int tn = 0; tn < N_PER_THREAD; ++tn)
+                {
+                    temp[tm][tn] += r_comp_a[tm] * r_comp_b[tn];
                 }
 
         }
         __syncthreads(); // avoid data hazard before next load
     }
 
-    // Write back the result in C
+    // Write back the result in C (can be simplified by Float 4)
 
-    for (int i = 0; i < NUM_PER_THREAD; ++i)
-        for (int j = 0; j < NUM_PER_THREAD; ++j)
+    for (int i = 0; i < comp_a_NUM_m; ++i)
+        for(int j = 0; j < comp_b_NUM_n; ++j)
         {
-            int y = yBase + 4 * ty + i; // global row index in C
-            int x = xBase + 4 * tx + j; // global col index in
-            if (y < M && x < N) C_ptr[y * N + x] = temp[i][j];
-        }
-    
+            int yyBase = i * comp_a_step_m;
+            int xxBase = j * comp_b_step_n;
+            for (int ii = 0; ii < 4; ++ii)
+                for (int jj = 0; jj < 4; ++jj)
+                {
+                    int x = xBase + xxBase + 4 * tx + jj;
+                    int y = yBase + yyBase + 4 * ty + ii;
+                    if (y < M && x < N)
+                    {
+                        C_ptr[y * N + x] = temp[4 * i + ii][4 * j + jj]; // write back the result
+                    }
+                }
+        }    
 
 }
 
 int main()
 {
     // Matrix sizes
-    int M = 512;
-    int N = 512;
-    int K = 512;
+    int M = 1024;
+    int N = 1024;
+    int K = 1024;
 
     // Host memory allocation
     const size_t mem_size_A = M * K * sizeof(float);
@@ -178,14 +214,14 @@ int main()
     // Launch GPU SGEMM kernel
     constexpr int N_BLOCK_SIZE = 16;
     constexpr int M_BLOCK_SIZE = 16;
-    // for simplicity, we assume K_TILE_SIZE is a multiple of 4
-    constexpr int K_TILE_SIZE = 64;
-    constexpr int N_TILE_SIZE = 64;
-    constexpr int M_TILE_SIZE = 64;
-    constexpr int NUM_PER_THREAD = 4;;
+    constexpr int K_TILE_SIZE = 8;
+    constexpr int N_TILE_SIZE = 128;
+    constexpr int M_TILE_SIZE = 128;
+    constexpr int N_PER_THREAD = N_TILE_SIZE / N_BLOCK_SIZE;
+    constexpr int M_PER_THREAD = M_TILE_SIZE / M_BLOCK_SIZE;
     dim3 block(N_BLOCK_SIZE, M_BLOCK_SIZE);
     dim3 grid((N + N_TILE_SIZE - 1) / N_TILE_SIZE, (M + M_TILE_SIZE - 1) / M_TILE_SIZE);
-    cuda_sgemm_v4<N_TILE_SIZE, M_TILE_SIZE, K_TILE_SIZE, NUM_PER_THREAD><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, M, N, K);
+    cuda_sgemm_v5<N_TILE_SIZE, M_TILE_SIZE, K_TILE_SIZE, N_PER_THREAD, M_PER_THREAD><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, M, N, K);
     printf("GPU SGEMM kernel launched.\n");
 
     // Retrieve result from GPU
