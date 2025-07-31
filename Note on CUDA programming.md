@@ -943,53 +943,79 @@ We use Float4 to pick 4 floats in a row at a time.
 
 ### A Shared Memory Transpose
 1. **Algorithm**:
-        We set L<sub>M</sub> = 4D<sub>M</sub>, L<sub>N</sub> = 4D<sub>N</sub> and assume D<sub>K</sub>  is a multiple of 4, the same as the last version
+        We set L<sub>M</sub> = T<sub>M</sub>*D<sub>M</sub>, L<sub>N</sub> = T<sub>N</sub>*D<sub>N</sub>. We require T<sub>N</sub> , T<sub>M</sub> and L<sub>K</sub> are divisible by 4.
+        Moreover, we need
+        (D<sub>M</sub> * D<sub>N</sub>)/(L<sub>N</sub>/4)
+        and
+        D<sub>M</sub> * D<sub>N</sub> / (L<sub>K</sub>/4)
+        are integers.
 
     We transpose A shared memory, so that we could use float4 instructions during computations 
-    - A_shared: (D<sub>K</sub>, D<sub>M</sub>)
-    - B_shared: (D<sub>K</sub>, D<sub>N</sub>)
+    - A_shared: (L<sub>K</sub>, L<sub>M</sub>)
+    - B_shared: (L<sub>K</sub>, L<sub>N</sub>)
 
     **Load $A_{I,S}$ into shared memory**:
 
-    For each thread (ty,tx), it should load $A_{I,S}$[yy, kk] into the shared memory
-    $A^\text{shared}_{S,I}[kk, yy]$
+    Map threadID from `(tx, ty)` to `tid` thorugh `tid = ty * D_N + tx`
+
+    initialize a register `r_load_A[4]`
+
+
+    For each thread `tid`, load $A_{I,S}$[yy, kk:kk +4] into the register `r_load_A`
+
     - (yy, kk): local indice for $A_{I,S}$
-    - yy = 4 * threadIdx.y + i, i = 0,1,2,3;
-    - kkBase = 4 * threadIdx.x; kkBase += L<sub>M</sub>; kkBase < L<sub>K</sub>;
-    - kk = kkBase + i, i = 0,1,2,3
+    - yy = tid/ (L<sub>K</sub>/4), yy < L_M, yy += D<sub>M</sub> * D<sub>N</sub> / (L<sub>K</sub>/4)
+    - kk = 4 * (tid % (L<sub>K</sub>/4))
+
+    and write to the shared memory $A^\text{shared}_{S,I}[kk, yy]$
+
+    - $A^\text{shared}_{S,I}[kk, yy]$ = r_load_A[0] 
+    - $A^\text{shared}_{S,I}[kk + 1, yy]$ = r_load_A[1] 
+    - $A^\text{shared}_{S,I}[kk + 2, yy]$ = r_load_A[2]
+    - $A^\text{shared}_{S,I}[kk + 3, yy]$ = r_load_A[3]
 
     **Load $B_{S,J}$ into shared memory**:
 
-    We didn't apply transpose to B shared memory
-    Each thread (ty, tx) will load $B_{S,J}$[kk, xx] into the shared memory load $B^\text{shared}_{S,J}$[kk, xx]
+    Map threadID from `(tx, ty)` to `tid` thorugh `tid = ty * D_N + tx`
+
+    initialize a register `r_load_B[4]`
+
+    We didn't apply transpose to B shared memory.
+    Each thread `tid` will load $B_{S,J}$[kk, xx:xx+4] into the
+    register `r_load_B` 
     - (kk, xx): local indice for $B_{S,J}$
-    - kkBase = 4*threadIdx.y; kkBase += L<sub>M</sub>; kkBase < L<sub>K</sub>;
-    - kk = kkBase + i, i = 0,1,2,3
-    - xx = 4*threadIdx.x + i, i = 0,1,2,3
+    - kk = tid/(L_N/4), kk < L_K, kk += (D_M * D_N)/(L_N/4)
+    - xx = 4 * (tid%(L_N/4))
+    
+    Then write the registers to shared memory $B^\text{shared}_{S,J}$[kk, xx]
+    - $B^\text{shared}_{S,J}$[kk, xx: xx+4] = r_load_B[0:4]
 
     **Compute $A_{I,S} B_{S,J}$**:
     
     From shared memory, we have
 
     $A_{I,S} B_{S,J} = \sum_{kk} A^\text{shared}_{S,I}[kk,:] \otimes B^\text{shared}_{S,J}[kk,:]$
+
+    Loop over 0< kk < L_K:
+
+    Initialize registers for computation
+
+    ```
+        float r_comp_a[TM];
+        float r_comp_b[TN];
+    ```
     
-    We can partition $A^\text{shared}_{S,I}[:,kk]$ into D<sub>M</sub> **row** vectors of length 4, and denote it by 
+    Write $A^\text{shared}_{S,I}[kk, yy:yy+4,kk]$ into `r_comp_a`
     
-    $A^\text{shared}_{S,I, kk, ty} = A^\text{shared}_{S,I}[kk, 4*ty:4*ty+4]$.
-
-    Similarly we partition $B^\text{shared}_{S,J}[kk,:]$ into D<sub>N</sub> row
-    vectors of length 4 and denote it by 
+    - yy = 4 * ty, yy + 4 * D_M, yy < L_M 
     
-    $B^\text{shared}_{S,J,kk,tx} = B^\text{shared}_{S,J}[kk, 4 * tx : 4 * tx + 4]$.
+    Write $B^\text{shared}_{S,I}[kk, xx:xx+4]$ into `r_comp_b`
 
-    Each thread (ty, tx) loads $A^\text{shared}_{S,I,kk,ty}$ and $B^\text{shared}_{S,J,kk,tx}$ 
-    to the register by using float4 and do the outer product
+    - xx = 4 * tx, xx + 4 * D_N, xx < L_N 
 
-    $C_{I,J}[yy, xx] += A^\text{shared}_{S,I,kk,ty}[i]*B^\text{shared}_{S,J,kk,tx}[j]$
+    The temp register now add 
 
-    where 
-    - yy = 4 * ty + i
-    - xx = 4 * tx + j
+    $C_{I,J}$[yy, xx] += r_comp_a[i]*r_comp_b[j]
 
     
 
