@@ -80,8 +80,8 @@ __global__ void cuda_sgemm_v5(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
     const int F4_PER_THREAD_b = (K_TILE_SIZE * M_TILE_SIZE + 4 * blockDim.x * blockDim.y - 1) / (4 * blockDim.x * blockDim.y); 
 
     // step size for loading A and B
-    const int STEP_LOAD_a = 4 * blockDim.x * blockDim.y / K_TILE_SIZE;
-    const int STEP_LOAD_b = 4 * blockDim.x * blockDim.y / N_TILE_SIZE;
+    const int STEP_LOAD_a_m = 4 * blockDim.x * blockDim.y / K_TILE_SIZE;
+    const int STEP_LOAD_b_k = 4 * blockDim.x * blockDim.y / N_TILE_SIZE;
 
     // Loading address for A and B (initially)
     int load_a_smem_m = tid / (K_TILE_SIZE / 4);
@@ -104,7 +104,7 @@ __global__ void cuda_sgemm_v5(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
         // Load A tile into shared memory
         for (int N_F4 =0; N_F4 < F4_PER_THREAD_a; ++N_F4)
         {
-            int yy = load_a_smem_m + N_F4 * STEP_LOAD_a;
+            int yy = load_a_smem_m + N_F4 * STEP_LOAD_a_m;
             int y = yBase + yy; 
             int k = kBase + load_a_smem_k;
             int load_a_gmem_addr = OFFSET(y, k, K);
@@ -116,9 +116,9 @@ __global__ void cuda_sgemm_v5(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
         }
 
         // Load B tile into shared memory
-        for (int M_F4 =0; M_F4 < F4_PER_THREAD_b; ++M_F4)
+        for (int N_F4 =0; N_F4 < F4_PER_THREAD_b; ++N_F4)
         {
-            int kk = load_b_smem_k + M_F4 * STEP_LOAD_b; 
+            int kk = load_b_smem_k + N_F4 * STEP_LOAD_b_k; 
             int k = kBase + kk;
             int x = xBase + load_b_smem_n;
             int load_b_gmem_addr = OFFSET(k, x, N);
@@ -131,14 +131,15 @@ __global__ void cuda_sgemm_v5(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
         for (int kk = 0; kk < K_TILE_SIZE; ++kk)
         {
             for (int i = 0; i < comp_a_NUM_m; ++i)
-                for(int j = 0; j < comp_b_NUM_n; ++j)
-                {
-                    int yy = 4 * ty + i * comp_a_step_m;
-                    int xx = 4 * tx + j * comp_b_step_n; 
-                    FETCH_FLOAT4(r_comp_a[4 * i]) = FETCH_FLOAT4(a_shared[kk][yy])
-                    FETCH_FLOAT4(r_comp_b[4 * j]) = FETCH_FLOAT4(b_shared[kk][xx])
-                }
-            
+            {
+                int yy = 4 * ty + i * comp_a_step_m; 
+                FETCH_FLOAT4(r_comp_a[4 * i]) = FETCH_FLOAT4(a_shared[kk][yy]);
+            }
+            for(int j = 0; j < comp_b_NUM_n; ++j)
+            {
+                int xx = 4 * tx + j * comp_b_step_n;
+                FETCH_FLOAT4(r_comp_b[4 * j]) = FETCH_FLOAT4(b_shared[kk][xx]);
+            }   
             for (int tm = 0; tm < M_PER_THREAD; ++tm)
                 for (int tn = 0; tn < N_PER_THREAD; ++tn)
                 {
