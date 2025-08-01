@@ -66,6 +66,7 @@ __global__ void cuda_sgemm_v5(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
     // per-thread accumulator
     float temp[M_PER_THREAD][N_PER_THREAD] = {0.0};
     float r_load_a[4];
+    float r_load_b[4];
     float r_comp_a[M_PER_THREAD]; 
     float r_comp_b[N_PER_THREAD];
 
@@ -73,15 +74,7 @@ __global__ void cuda_sgemm_v5(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
     const int NUM_TILES = (K + K_TILE_SIZE - 1) / K_TILE_SIZE;
 
     // 1D threadID
-    const int tid = ty * blockDim.x + tx;
-    
-    // how many float4 each thread will load
-    const int F4_PER_THREAD_a = (M_TILE_SIZE * K_TILE_SIZE + 4 * blockDim.x * blockDim.y - 1) / (4 * blockDim.x * blockDim.y);
-    const int F4_PER_THREAD_b = (K_TILE_SIZE * M_TILE_SIZE + 4 * blockDim.x * blockDim.y - 1) / (4 * blockDim.x * blockDim.y); 
-
-    // step size for loading A and B
-    const int STEP_LOAD_a_m = 4 * blockDim.x * blockDim.y / K_TILE_SIZE;
-    const int STEP_LOAD_b_k = 4 * blockDim.x * blockDim.y / N_TILE_SIZE;
+    const int tid = ty * blockDim.x + tx; 
 
     // Loading address for A and B (initially)
     int load_a_smem_m = tid / (K_TILE_SIZE / 4);
@@ -101,30 +94,23 @@ __global__ void cuda_sgemm_v5(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
     {  
         int kBase = tile * K_TILE_SIZE; // starting K index of this tile
         
-        // Load A tile into shared memory
-        for (int N_F4 =0; N_F4 < F4_PER_THREAD_a; ++N_F4)
-        {
-            int yy = load_a_smem_m + N_F4 * STEP_LOAD_a_m;
-            int y = yBase + yy; 
-            int k = kBase + load_a_smem_k;
-            int load_a_gmem_addr = OFFSET(y, k, K);
-            FETCH_FLOAT4(r_load_a[0]) = FETCH_FLOAT4(A_ptr[load_a_gmem_addr]);
-            a_shared[load_a_smem_k][yy] = r_load_a[0];
-            a_shared[load_a_smem_k + 1][yy] = r_load_a[1];
-            a_shared[load_a_smem_k + 2][yy] = r_load_a[2];
-            a_shared[load_a_smem_k + 3][yy] = r_load_a[3];
-        }
+        // Load A and B tile into register
+        int y = yBase + load_a_smem_m; 
+        int k_a = kBase + load_a_smem_k;
+        int load_a_gmem_addr = OFFSET(y, k_a, K);
+        FETCH_FLOAT4(r_load_a[0]) = FETCH_FLOAT4(A_ptr[load_a_gmem_addr]);
+        int k_b = kBase + load_b_smem_k;
+        int x = xBase + load_b_smem_n;
+        int load_b_gmem_addr = OFFSET(k_b, x, N);
+        FETCH_FLOAT4(r_load_b[0]) = FETCH_FLOAT4(B_ptr[load_b_gmem_addr]);
 
-        // Load B tile into shared memory
-        for (int N_F4 =0; N_F4 < F4_PER_THREAD_b; ++N_F4)
-        {
-            int kk = load_b_smem_k + N_F4 * STEP_LOAD_b_k; 
-            int k = kBase + kk;
-            int x = xBase + load_b_smem_n;
-            int load_b_gmem_addr = OFFSET(k, x, N);
-            FETCH_FLOAT4(b_shared[kk][load_b_smem_n]) = FETCH_FLOAT4(B_ptr[load_b_gmem_addr]);
-        }
-
+        // From register to shared memory
+        a_shared[load_a_smem_k][load_a_smem_m] = r_load_a[0];
+        a_shared[load_a_smem_k + 1][load_a_smem_m] = r_load_a[1];
+        a_shared[load_a_smem_k + 2][load_a_smem_m] = r_load_a[2];
+        a_shared[load_a_smem_k + 3][load_a_smem_m] = r_load_a[3];
+        FETCH_FLOAT4(b_shared[load_b_smem_k][load_b_smem_n]) = FETCH_FLOAT4(r_load_b[0]);
+        
         __syncthreads();   // ensures tiles fully populated
 
         // Compute the outer product for this tile
