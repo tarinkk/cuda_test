@@ -155,18 +155,12 @@ __global__ void cuda_sgemm_v5(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
     for (int i = 0; i < comp_a_NUM_m; ++i)
         for(int j = 0; j < comp_b_NUM_n; ++j)
         {
-            int yyBase = i * comp_a_step_m;
-            int xxBase = j * comp_b_step_n;
-            for (int ii = 0; ii < 4; ++ii)
-                for (int jj = 0; jj < 4; ++jj)
-                {
-                    int x = xBase + xxBase + 4 * tx + jj;
-                    int y = yBase + yyBase + 4 * ty + ii;
-                    if (y < M && x < N)
-                    {
-                        C_ptr[y * N + x] = temp[4 * i + ii][4 * j + jj]; // write back the result
-                    }
-                }
+            int y = yBase + i * comp_a_step_m + 4 * ty;
+            int x = xBase + j * comp_b_step_n + 4 * tx; 
+            FETCH_FLOAT4(C_ptr[y * N + x]) = FETCH_FLOAT4(temp[4*i][4*j]);
+            FETCH_FLOAT4(C_ptr[(y + 1) * N + x]) = FETCH_FLOAT4(temp[4*i + 1][4*j]);
+            FETCH_FLOAT4(C_ptr[(y + 2) * N + x]) = FETCH_FLOAT4(temp[4*i + 2][4*j]);
+            FETCH_FLOAT4(C_ptr[(y + 3) * N + x]) = FETCH_FLOAT4(temp[4*i + 3][4*j]);
         }    
 
 }
