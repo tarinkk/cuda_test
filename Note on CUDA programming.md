@@ -15,6 +15,8 @@
     - [Increase Work Per Thread](#increase-work-per-thread)
     - [Using Float4](#using-float4)
     - [Register Outer Product](#register-outer-product)
+    - [A Shared Memory Transpose](#a-shared-memory-transpose)
+    - [Double Buffering](#double-buffering)
 ## CUDA Reduction Kernel
 
 The CUDA kernel performs a parallel reduction operation to compute the sum of elements in an input array. Each block processes a section of the input array, computes the sum of its elements, and writes the result to an output array.
@@ -1021,7 +1023,93 @@ We use Float4 to pick 4 floats in a row at a time.
 
 
 
-## Reference:
+### Double Buffering
+1. **Algorithm**:
+    Building upon the shared memory transpose approach, we implement double buffering to overlap memory transfers with computation, reducing overall latency.
+
+    We use dual shared memory buffers:
+    - A_shared: `[2][L_K][L_M]` (double buffered)
+    - B_shared: `[2][L_K][L_N]` (double buffered)
+
+    The algorithm follows a pipelined approach:
+    1. **Pre-load first tile**: Load the first K-tile into buffer 0
+    2. **Overlapped execution**: For subsequent tiles, while computing on buffer `i`, load the next tile into buffer `1-i`
+    3. **Buffer selection**: Use `smem_sel = (tile-1) & 1` and `smem_sel_next = tile & 1` to alternate between buffers
+
+    **Load and Compute Pipeline**:
+
+    ```cuda
+    // Pre-load first tile into buffer 0
+    {
+        FETCH_FLOAT4(r_load_a[0]) = FETCH_FLOAT4(A_ptr[load_a_gmem_addr]);
+        FETCH_FLOAT4(r_load_b[0]) = FETCH_FLOAT4(B_ptr[load_b_gmem_addr]);
+        
+        // Store in buffer 0
+        a_shared[0][load_a_smem_k][load_a_smem_m] = r_load_a[0];
+        a_shared[0][load_a_smem_k + 1][load_a_smem_m] = r_load_a[1];
+        a_shared[0][load_a_smem_k + 2][load_a_smem_m] = r_load_a[2];
+        a_shared[0][load_a_smem_k + 3][load_a_smem_m] = r_load_a[3];
+        FETCH_FLOAT4(b_shared[0][load_b_smem_k][load_b_smem_n]) = FETCH_FLOAT4(r_load_b[0]);
+    }
+
+    // Pipeline: load next tile while computing current tile
+    for (int tile = 1; tile < NUM_TILES; ++tile) {
+        int smem_sel = (tile - 1) & 1;       // Current buffer for computation
+        int smem_sel_next = tile & 1;        // Next buffer for loading
+        
+        // Load next tile into registers
+        int load_a_gmem_k = kBase + load_a_smem_k;
+        FETCH_FLOAT4(r_load_a[0]) = FETCH_FLOAT4(A_ptr[load_a_gmem_addr]);
+        FETCH_FLOAT4(r_load_b[0]) = FETCH_FLOAT4(B_ptr[load_b_gmem_addr]);
+        
+        // Compute using current buffer
+        for (int kk = 0; kk < K_TILE_SIZE; ++kk) {
+            FETCH_FLOAT4(r_comp_a[4 * i]) = FETCH_FLOAT4(a_shared[smem_sel][kk][yy]);
+            FETCH_FLOAT4(r_comp_b[4 * j]) = FETCH_FLOAT4(b_shared[smem_sel][kk][xx]);
+            
+            for (int tm = 0; tm < M_PER_THREAD; ++tm)
+                for (int tn = 0; tn < N_PER_THREAD; ++tn)
+                    temp[tm][tn] += r_comp_a[tm] * r_comp_b[tn];
+        }
+        
+        // Store loaded data into next buffer
+        a_shared[smem_sel_next][load_a_smem_k][load_a_smem_m] = r_load_a[0];
+        // ... (similar for other elements)
+        
+        __syncthreads();
+    }
+    ```
+
+2. **Key Improvements over v5 (Shared Memory Transpose)**:
+    - **Reduced Memory Latency**: Overlaps global memory loads with computation, hiding memory access latency
+    - **Elimination of Redundant Synchronization**: Reduces the number of `__syncthreads()` barriers needed between load and compute phases
+
+3. **Pipeline Order Analysis**:
+    
+    **Why the execution order (load → compute → store) is crucial:**
+    
+    The specific order of operations in the pipeline is critical for performance:
+    
+    Key shorthand:
+
+    - LDG – load from global memory into a register
+
+    - STS – store from a register into shared memory
+
+    - FFMA – fused-multiply-add (the core SGEMM arithmetic)
+
+    For each warp, instructions are issued strictly in program order; the hardware does not reorder them like a modern CPU.
+
+    When an LDG is issued, its destination register is marked “pending.”
+
+    Any later instruction that reads that register is blocked until the scoreboard marks it “ready.”
+
+    Immediately afterward, the warp issues hundreds of FFMA instructions that do not touch the loading register.
+
+    When the LDG finally returns, the scoreboard clears, the waiting STS can now issue and move the freshly fetched tile into shared memory.
+
+## Reference
+
 1. [[CUDA]Reduce规约求和（已完结~）](https://www.bilibili.com/video/BV1HvBSY2EJW?spm_id_from=333.788.videopod.episodes&vd_source=aa41d00aebd84e6f99f529df7f83258a)
 2. [深入浅出GPU优化系列：reduce优化](https://zhuanlan.zhihu.com/p/426978026)
 3. [[CUDA编程]束内洗牌函数 (Warp Shuffle Functions)](https://zhuanlan.zhihu.com/p/669957986)

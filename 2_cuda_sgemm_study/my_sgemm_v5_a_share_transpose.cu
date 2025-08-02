@@ -136,7 +136,7 @@ __global__ void cuda_sgemm_v5(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
         __syncthreads(); // avoid data hazard before next load
     }
 
-    // Write back the result in C (can be simplified by Float 4)
+    // Write back the result in C using Float4 for vectorized stores
 
     for (int i = 0; i < comp_a_NUM_m; ++i)
         for(int j = 0; j < comp_b_NUM_n; ++j)

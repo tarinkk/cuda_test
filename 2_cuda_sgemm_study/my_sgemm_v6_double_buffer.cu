@@ -59,7 +59,7 @@ __global__ void cuda_sgemm_v6(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
     const int xBase = blockIdx.x * N_TILE_SIZE; // global col of block’s left edge
     const int yBase = blockIdx.y * M_TILE_SIZE; // global row of block’s top edge
 
-    // shared memory staging buffers
+    // Double-buffered shared memory staging buffers
     __shared__ float a_shared[2][K_TILE_SIZE][M_TILE_SIZE];
     __shared__ float b_shared[2][K_TILE_SIZE][N_TILE_SIZE];
 
@@ -91,7 +91,7 @@ __global__ void cuda_sgemm_v6(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
     int comp_a_NUM_m = M_TILE_SIZE / comp_a_step_m;
     int comp_b_NUM_n = N_TILE_SIZE / comp_b_step_n;
 
-    // Load first tile in A and B to the first buffer
+    // Pre-load first tile into buffer 0 to prime the pipeline
     {      
         // Load A and B tile into register
         int load_a_gmem_k = load_a_smem_k;
@@ -110,15 +110,15 @@ __global__ void cuda_sgemm_v6(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
     }
 
 
-    // Load A and B tiles into shared memory
+    // Double-buffering pipeline: overlap loading next tile with computing current tile
     for (int tile = 1; tile < NUM_TILES; ++tile)
     {  
         int kBase = tile * K_TILE_SIZE; // starting K index of this tile
 
-        int smem_sel = (tile - 1) & 1; // toggle between 0 and 1 for double buffering
-        int smem_sel_next = tile & 1; 
+        int smem_sel = (tile - 1) & 1; // current buffer for computation
+        int smem_sel_next = tile & 1;   // next buffer for loading 
         
-        // Load A and B tile into register
+        // Load next tile into registers (overlaps with computation below)
         int load_a_gmem_k = kBase + load_a_smem_k;
         int load_a_gmem_addr = OFFSET(load_a_gmem_m, load_a_gmem_k, K);
         FETCH_FLOAT4(r_load_a[0]) = FETCH_FLOAT4(A_ptr[load_a_gmem_addr]);
@@ -126,7 +126,7 @@ __global__ void cuda_sgemm_v6(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
         int load_b_gmem_addr = OFFSET(load_b_gmem_k , load_b_gmem_n , N);
         FETCH_FLOAT4(r_load_b[0]) = FETCH_FLOAT4(B_ptr[load_b_gmem_addr]);
 
-        // Compute the outer product for this tile
+        // Compute using current buffer while next tile loads
         for (int kk = 0; kk < K_TILE_SIZE; ++kk)
         {
             for (int i = 0; i < comp_a_NUM_m; ++i)
@@ -147,7 +147,7 @@ __global__ void cuda_sgemm_v6(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
 
         }
 
-        // From register to shared memory
+        // Store loaded data from registers to next buffer
         a_shared[smem_sel_next][load_a_smem_k][load_a_smem_m] = r_load_a[0];
         a_shared[smem_sel_next][load_a_smem_k + 1][load_a_smem_m] = r_load_a[1];
         a_shared[smem_sel_next][load_a_smem_k + 2][load_a_smem_m] = r_load_a[2];
@@ -157,18 +157,19 @@ __global__ void cuda_sgemm_v6(float *A_ptr, float *B_ptr, float *C_ptr, int M, i
         __syncthreads();   
     }
 
+    // Process final tile (no more loading needed)
     {
         for (int kk = 0; kk < K_TILE_SIZE; ++kk)
         {
             for (int i = 0; i < comp_a_NUM_m; ++i)
             {
                 int yy = 4 * ty + i * comp_a_step_m; 
-                FETCH_FLOAT4(r_comp_a[4 * i]) = FETCH_FLOAT4(a_shared[1][kk][yy]);
+                FETCH_FLOAT4(r_comp_a[4 * i]) = FETCH_FLOAT4(a_shared[(NUM_TILES-1) & 1][kk][yy]);
             }
             for(int j = 0; j < comp_b_NUM_n; ++j)
             {
                 int xx = 4 * tx + j * comp_b_step_n;
-                FETCH_FLOAT4(r_comp_b[4 * j]) = FETCH_FLOAT4(b_shared[1][kk][xx]);
+                FETCH_FLOAT4(r_comp_b[4 * j]) = FETCH_FLOAT4(b_shared[(NUM_TILES-1) & 1][kk][xx]);
             }   
             for (int tm = 0; tm < M_PER_THREAD; ++tm)
                 for (int tn = 0; tn < N_PER_THREAD; ++tn)
